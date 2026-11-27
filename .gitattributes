@@ -1,0 +1,7 @@
+# The capture/burn scripts and the generated probe source run on the Linux
+# host; a stray CR there is a broken build or a bash "$'\r'" error. Pin them to
+# LF in the index and on checkout so a clone on any platform is runnable.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.c     text eol=lf
+*.json  text eol=lf

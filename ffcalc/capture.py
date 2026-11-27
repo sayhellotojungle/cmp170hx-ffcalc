@@ -41,7 +41,19 @@ DEFAULT_MAP = os.path.join(_HERE, "data", "ga100-fuses.json")
 DEVICE_IDS = tuple("0x%04x" % v for v in (CMP_DEVID, A100_DEVID))
 
 
-def open_bar0(bdf=None):
+def open_bar0(bdf=None, writable=False):
+    """Map a card's BAR0, read-only unless the caller really writes.
+
+    `writable` is the difference between "look at the card" and "change the
+    card": the word capture maps ACCESS_READ, so a stray pointer bug cannot
+    reach a card that is serving traffic. Only the fuse-macro commands (the
+    burn path, and CMD_READ, which writes FUSEADDR/FUSECTRL) ask for
+    ACCESS_WRITE, and both want the card idle.
+
+    This is also the access pattern the community unlocker uses against a live
+    driver: the kernel refuses sysfs resource0 mmap/read for a bound device, so
+    it has to be O_RDWR/O_SYNC with the driver attached.
+    """
     base = "/sys/bus/pci/devices"
     cands = []
     for dev in sorted(os.listdir(base)):
@@ -60,13 +72,11 @@ def open_bar0(bdf=None):
     if not cands:
         raise SystemExit("no device %s found" % " or ".join(DEVICE_IDS))
     path = os.path.join(base, cands[0], "resource0")
-    # Same access pattern cmpunlocker uses against a live nvidia driver:
-    # fd opened O_RDWR, mapping ACCESS_WRITE. Word capture reads only;
-    # --read-ff-rows writes just FUSEADDR/FUSECTRL (CMD_READ command).
-    fd = os.open(path, os.O_SYNC | os.O_RDWR)
+    fd = os.open(path, os.O_SYNC | (os.O_RDWR if writable else os.O_RDONLY))
     try:
         length = os.path.getsize(path) or BAR0_LEN
-        mm = mmap.mmap(fd, length, access=mmap.ACCESS_WRITE)
+        mm = mmap.mmap(fd, length,
+                       access=mmap.ACCESS_WRITE if writable else mmap.ACCESS_READ)
     finally:
         os.close(fd)
     return cands[0], mm
@@ -86,12 +96,26 @@ def _off(addr):
 
 
 def rd(mm, addr):
-    mm.seek(_off(addr))
+    """One 32-bit BAR0 word.
+
+    The bounds check is not decoration: reading past the mapping is what took a
+    host down once (a register table entry beyond the window the probe had
+    mapped). A clean error here, an OOPS in a kernel module.
+    """
+    off = _off(addr)
+    if off < 0 or off + 4 > len(mm):
+        raise ValueError("BAR0 offset 0x%x outside the mapping (0x%x bytes)"
+                         % (off & 0xffffffff, len(mm)))
+    mm.seek(off)
     return struct.unpack("<I", mm.read(4))[0]
 
 
 def wr(mm, addr, value):
-    mm.seek(_off(addr))
+    off = _off(addr)
+    if off < 0 or off + 4 > len(mm):
+        raise ValueError("BAR0 offset 0x%x outside the mapping (0x%x bytes)"
+                         % (off & 0xffffffff, len(mm)))
+    mm.seek(off)
     mm.write(struct.pack("<I", value & 0xffffffff))
 
 
@@ -116,7 +140,9 @@ def main():
     except ValueError as e:
         raise SystemExit("bad option map %s: %s" % (args.map, e))
 
-    bdf, mm = open_bar0(args.bdf)
+    # Only the CMD_READ pass writes (FUSEADDR/FUSECTRL); the word capture maps
+    # the BAR read-only so a bug in this process cannot reach a live card.
+    bdf, mm = open_bar0(args.bdf, writable=bool(args.read_ff_rows))
     words = {}
     for key, loc in m["fields"].items():
         fused = rd(mm, loc["fused"]) if loc.get("fused") else None

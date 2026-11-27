@@ -38,6 +38,10 @@ EFFECTIVE = {
 # hardware as OPT_DISABLE | OPT_DEFECTIVE, so every pair below being equal is
 # the proof that clearing the floorsweep switches on real silicon -- which is
 # what these fields require before an irreversible row is spent on them.
+# The rest is what an unlocked card under the driver-side unlocker reads back:
+# the fused speed selects stay at the 1/32-rate setting and the feature-override
+# island is what runs the blocks at full rate, so a stock card shows the same
+# runtime words whether or not its FF pool has been burnt.
 INFO = {
     "secured_burn_feature_enable": 0x1,
     "en_sw_override": 0x0,          # CTRL_OPT_* overrides are inert here
@@ -54,6 +58,61 @@ INFO = {
     "status_half_fbpa": 0x0,
     "status_half_ltc": 0x0,
     "status_pcie_lane": 0x0,
+
+    # Fuse macro: healthy, outside the burn window (driver attached), factory
+    # IFF window rows 488-507 -- the word that fixes where the FF pool ends.
+    "fuse_debugctrl": 0x0,          # bit 1 = RWL: RIR macro not selected
+    "iff_record": 0x01FB01E8,
+    "crc_status": 0x55,             # healthy chain CRC
+    "efp_status": 0x1,
+    "dis_program": 0x0,
+    "wdata_wr_secure": 0x1,         # 1 = locked (outside the window); 0 while armed
+    "plm_fuse_wdata": 0xFFFFFFFF,
+    "priv_mask": 0xFFFFFFFF,
+
+    # Feature-override island: what the unlocker writes each boot, and the one
+    # word that says whether compute is running at full rate right now.
+    "feat_ovr_ecc_plm": 0xFFFFFFFF,
+    "feat_ovr_plm": 0xFFFFFFFF,
+    "feat_ovr_quadro": 0x00000181,
+    "feat_ovr_ecc": 0x00999999,
+    "feat_ovr_ecc_1": 0x003FFEBF,
+    "feat_ovr_ecc_2": 0xF,
+    "feat_ovr_sm_spd_0": 0x88888888,
+    "feat_ovr_sm_spd_1": 0x00000008,
+    "feat_ovr_row_remap": 0x0,
+    "feat_readout_1": 0x0,          # 0 = no throttle in effect; 0x016db6ed = throttled
+
+    # Fused speed selects: 0x5 is the 1/32-rate slot, and this is the half the
+    # FF pool does not carry -- an unlocked card still reads them throttled.
+    "ss_dp": 0x1,
+    "ss_ffma": 0x5,
+    "ss_fmla16": 0x5,
+    "ss_fmla32": 0x5,
+    "ss_imla0": 0x5,
+    "ss_imla1": 0x5,
+    "ss_imla2": 0x5,
+    "ss_imla3": 0x5,
+    "ss_imla4": 0x5,
+
+    # ECC and geometry, both runtime state: fused ECC off, DRAM sideband on for
+    # this boot, framebuffer mapped to the unlocked size.
+    "opt_ecc_en": 0x0,
+    "ecc_ctrl": 0x41,               # MASTER_EN | SIDEBAND_EN
+    "fbpa_cfg1": 0x02779000,
+    "cstatus_ramamount": 0x1000,    # the unlocked 80 GiB mapping
+    "mmu_lmr": 0x0000028B,
+
+    # Board facts the fuses do not restrict: no lane disabled, none defective,
+    # GSP firmware boot complete. HBM at the busy coefficient (27 MHz x 64 =
+    # 1728 MHz); the same two cards read 0x00011401 (540 MHz) with nothing on
+    # them, and the host unlocker prints 0x14001 as its busy_coeff, so this word
+    # is HBM power management and says nothing about the fuse state.
+    "gfw_boot": 0x3FF,
+    "opt_pcie_lane_disable": 0x0,
+    "opt_pcie_lane_defective": 0x0,
+    "hbm_pll_plm": 0xFFFFFFDF,
+    "hbm_pll_coeff": 0x00014001,
 }
 
 DEFECTIVE = {

@@ -4,6 +4,23 @@ from .optionmap import (BY_KEY, ENGINES, FIELDS, FF_ROW_MAX, FF_ROW_MIN,
                         TOTAL_FBP, TOTAL_GPC, TPC_PER_GPC, SM_PER_TPC,
                         TOTAL_SYS_PIPE, BYTES_PER_FBP, popcount)
 
+# Speed-select readout that the community register table labels the 1/32-rate
+# slot. Our unlocked cards read 0x5 in these words while the feature-override
+# island reports no throttle, which is the evidence that the FF pool does not
+# govern the effective rate: it only holds the factory setting.
+SS_THROTTLED = 0x5
+# NV_PTIMER GSP/firmware boot progress: every step done reads 0x3ff.
+GFW_CLEAN = 0x3FF
+# Reference clock the HBM PLL multiplies (NV_PFB_FBM_PLL_CFG1 coeff N, [15:8]).
+PLL_REF_MHZ = 27
+# The two HBM PLL coefficients seen on our cards: the loaded one (27 MHz x 64 =
+# 1728 MHz, and the same value the host's own cmp_hbm_pm driver prints as
+# busy_coeff) and the idle one (27 MHz x 20 = 540 MHz). Both cards read the idle
+# coefficient with nothing on them and the loaded one under traffic, so the word
+# is power management, not a stock/modified distinction.
+HBM_BUSY_COEFF = 0x00014001
+HBM_IDLE_COEFF = 0x00011401
+
 
 def ff_rows_only(dump):
     return {r: v for r, v in dump["ff_rows"].items()
@@ -156,11 +173,13 @@ def analyze_media(dump, targets, warnings, info=None):
             "1 SYS_PIPE after this plan: MIG stays single-instance (`mig "
             "-lgip` shows one non-partitionable 1g profile); %s" % why)
 
-    # Why the FF burn is the only lever: with the software-override route dead
-    # on datacenter GA100, no volatile write to CTRL_OPT_* moves STATUS_OPT_*.
+    # Why an FF record is the only lever for these bits: the volatile route is
+    # inert on datacenter GA100, so no write to CTRL_OPT_* moves STATUS_OPT_*.
+    # (The 0x8238xx feature-override island is a different mechanism and is not
+    # inert -- see runtime_state().)
     # Note the alias: 0x820084 is the word ffmacro reads as DSOV_STATUS and
-    # demands be 0 inside the write window (and the community floorsweep reports
-    # call FUSE_DIS_SW_OVR, read as 1 under a running driver -- same register,
+    # demands be 0 inside the write window (and the floorsweep literature calls
+    # it FUSE_DIS_SW_OVR, read as 1 under a running driver -- same register,
     # two names, two ends of the same fact). So the verdict rests on
     # EN_SW_OVERRIDE = 0, which says the override path is not enabled at all,
     # and DSOV is reported alongside so the reader can see both names.
@@ -178,10 +197,97 @@ def analyze_media(dump, targets, warnings, info=None):
                         "status": disp, "disp_head": heads}}
 
 
+def runtime_state(info):
+    """What the card is running on *this boot*, as read from BAR0.
+
+    The fuses decide the resource set: SM count, memory size, NVLink, link
+    speed. They do not decide what rate the compute blocks run at, whether ECC
+    is on, or what geometry the framebuffer is mapped with: those are the
+    feature-override island and the FB block registers, written every boot by
+    the driver-side unlocker and taken back by a power cut. Reading them keeps
+    "the FF records allow it" from being mistaken for "this boot is running
+    unthrottled with ECC on", which are claims about two different things.
+
+    Values are the ones two unlocked CMP 170HX cards under a running driver
+    read; a snapshot taken before this readout map existed reports the section
+    as not read rather than guessing at it.
+    """
+    selects = dict((k, info[k]) for k in
+                   ("ss_dp", "ss_ffma", "ss_fmla16", "ss_fmla32", "ss_imla0",
+                    "ss_imla1", "ss_imla2", "ss_imla3", "ss_imla4")
+                   if k in info)
+    out = {}
+
+    if selects or "feat_readout_1" in info or "feat_ovr_sm_spd_0" in info:
+        out["compute"] = {
+            "read": "feat_readout_1" in info,
+            "readout": info.get("feat_readout_1"),
+            "full_rate_now": info.get("feat_readout_1") == 0,
+            "override": [info.get("feat_ovr_sm_spd_0"),
+                         info.get("feat_ovr_sm_spd_1")],
+            "fused": selects,
+            "fused_throttled": sorted(k for k, v in selects.items()
+                                      if v == SS_THROTTLED),
+        }
+
+    ctrl, ecc_fused = info.get("ecc_ctrl"), info.get("opt_ecc_en")
+    sram_keys = ("feat_ovr_ecc", "feat_ovr_ecc_1", "feat_ovr_ecc_2")
+    if ctrl is not None or ecc_fused is not None:
+        out["ecc"] = {
+            "read": True,
+            "fused": ecc_fused,
+            "ctrl": ctrl,
+            "dram_master": None if ctrl is None else bool(ctrl & 0x1),
+            "dram_sideband": None if ctrl is None else bool(ctrl & 0x40),
+            "sram": [info.get(k) for k in sram_keys],
+            "sram_read": all(k in info for k in sram_keys),
+        }
+
+    geom = dict((k, info[k]) for k in ("fbpa_cfg1", "mmu_lmr",
+                                       "cstatus_ramamount") if k in info)
+    if geom:
+        out["geometry"] = geom
+
+    coeff = info.get("hbm_pll_coeff")
+    hbm_state = None
+    if coeff is not None:
+        hbm_state = {HBM_BUSY_COEFF: "the busy coefficient the host unlocker "
+                                      "programs",
+                     HBM_IDLE_COEFF: "idle: HBM downclocked"}.get(
+            coeff, "a coefficient the host unlocker does not use")
+    out["board"] = {
+        "lane_disable": info.get("opt_pcie_lane_disable"),
+        "lane_defective": info.get("opt_pcie_lane_defective"),
+        "gfw_boot": info.get("gfw_boot"),
+        "gfw_clean": info.get("gfw_boot") == GFW_CLEAN,
+        "hbm_pll_coeff": coeff,
+        "hbm_mhz": None if coeff is None else PLL_REF_MHZ * ((coeff >> 8) & 0xff),
+        "hbm_state": hbm_state,
+    }
+
+    iff = info.get("iff_record")
+    macro = {
+        "crc": info.get("crc_status"), "efp": info.get("efp_status"),
+        "dsov": info.get("dsov_status"),
+        "en_sw_override": info.get("en_sw_override"),
+        "debugctrl": info.get("fuse_debugctrl"),
+        "priv_mask": info.get("priv_mask"),
+        "plm_fuse_wdata": info.get("plm_fuse_wdata"),
+        "wdata_wr_secure": info.get("wdata_wr_secure"),
+        "dis_program": info.get("dis_program"),
+        "iff_window": None if iff is None else (iff & 0x1FF, (iff >> 16) & 0x1FF),
+    }
+    if any(v is not None for v in macro.values()):
+        out["macro"] = macro
+    return out
+
+
 def analyze(dump, overrides=None):
     targets, warnings = resolve_targets(dump, overrides)
     words = dump["option_words"]
-    media = analyze_media(dump, targets, warnings, _info_words(dump))
+    info = _info_words(dump)
+    media = analyze_media(dump, targets, warnings, info)
+    runtime = runtime_state(info)
 
     fbp_cur = words.get("fbp_disable")
     fbp_tgt = targets.get("fbp_disable")
@@ -237,5 +343,6 @@ def analyze(dump, overrides=None):
         "nvlink_ok": (nvlink == 0) if nvlink is not None else None,
         "pcie_gen4_ok": pcie_clear,
         "media": media,
+        "runtime": runtime,
         "warnings": warnings,
     }

@@ -3,7 +3,7 @@ import os
 import sys
 
 from . import ffrows, ingest
-from .analyze import analyze
+from .analyze import SS_THROTTLED, analyze
 from .dump import (BadSnapshot, atomic_write_json, load_dump, load_plan,
                    update_rows)
 from .generate import plan
@@ -94,9 +94,89 @@ def _print_analysis(rep):
     print("  PCIe Gen3/4: %s" % ("bits clearable" if rep["pcie_gen4_ok"]
                                  else "stays restricted"))
     _print_media(rep)
+    _print_runtime(rep)
     _print_devid(rep)
     for msg in rep["warnings"]:
         print("  WARN: %s" % msg)
+
+
+def _print_runtime(rep):
+    """What this boot is running on, as opposed to what the fuses allow.
+
+    The FF pool sets the resource set (SMs, memory, NVLink, link speed). Rate,
+    ECC and geometry are runtime registers the driver-side unlocker rewrites
+    every boot, so the two layers do not imply each other: our cards have
+    OPT_ECC_EN fused to 0 while ECC_CTRL reports DRAM ECC enabled for this boot,
+    and the speed selects read their factory setting while the blocks run
+    unthrottled. Every word here is read-only, read off two unlocked cards with
+    the driver attached; a snapshot taken before the readout map carried them
+    says so instead of inventing a value.
+    """
+    rt = rep.get("runtime") or {}
+    print("\n[Runtime state (BAR0, this boot)]")
+    c = rt.get("compute")
+    if c:
+        if c["read"]:
+            print("  compute: FEAT_READOUT_1=0x%08x -> %s"
+                  % (c["readout"], "no throttle bit set"
+                     if c["full_rate_now"] else "throttle bits set"))
+        else:
+            print("  compute: FEAT_READOUT_1 not read")
+        if None not in (c["override"][0], c["override"][1]):
+            print("    feature-override SS0/SS1 = 0x%08x / 0x%08x: volatile, "
+                  "rewritten every boot by the driver-side unlocker"
+                  % (c["override"][0], c["override"][1]))
+        if c["fused_throttled"]:
+            print("    speed selects reading 0x%x (%s) while the blocks above "
+                  "are unthrottled: the FF pool does not carry these words, so "
+                  "the effective rate comes from the feature-override island, "
+                  "not from a burnt record"
+                  % (SS_THROTTLED, ", ".join("%s=0x%x" % (k, v) for k, v in
+                                             sorted(c["fused"].items())
+                                             if k in c["fused_throttled"])))
+    e = rt.get("ecc")
+    if e:
+        print("  ECC: fused OPT_ECC_EN=0x%08x (%s); DRAM ECC_CTRL=0x%08x "
+              "(master=%s sideband=%s); SRAM overrides 0x%08x/0x%08x/0x%08x"
+              % (e["fused"], "fused on" if e["fused"] else "fused off",
+                 e["ctrl"], e["dram_master"], e["dram_sideband"],
+                 e["sram"][0], e["sram"][1], e["sram"][2]))
+        if not e["fused"] and (e["dram_sideband"] or e["dram_master"]):
+            print("    on for this boot only: DRAM/SRAM ECC here is runtime "
+                  "state, not a burnt column fuse")
+    g = rt.get("geometry")
+    if g:
+        print("  geometry: FBPA_CFG1=0x%08x MMU_LMR=0x%08x RAMAMOUNT=0x%08x "
+              "(volatile: the unlocker rewrites the framebuffer map each boot, "
+              "an FLR puts the stock value back)"
+              % (g["fbpa_cfg1"], g["mmu_lmr"], g["cstatus_ramamount"]))
+    b = rt.get("board") or {}
+    if b.get("gfw_boot") is not None or b.get("lane_disable") is not None:
+        print("  board: OPT_PCIE_LANE_DISABLE=0x%x/_DEFECTIVE=0x%x %s; "
+              "GFW_BOOT=0x%08x (%s)"
+              % (b.get("lane_disable", 0), b.get("lane_defective", 0),
+                 "-> nothing fused off: the width the card trains is the "
+                 "slot's doing (check lspci LnkSta), not a fuse"
+                 if not b.get("lane_disable") and not b.get("lane_defective")
+                 else "-> lanes are limited in fuses/silicon",
+                 b.get("gfw_boot", 0),
+                 "POSTed clean" if b.get("gfw_clean") else "boot steps missing"))
+    if b.get("hbm_mhz") is not None:
+        print("  HBM PLL: coeff 0x%08x -> %d MHz (%s)"
+              % (b["hbm_pll_coeff"], b["hbm_mhz"], b["hbm_state"]))
+    m = rt.get("macro")
+    if m:
+        def word(v, fmt="0x%08x"):
+            return "not read" if v is None else (fmt % v)
+        print("  fuse macro: CRC=%s DSOV=%s DEBUGCTRL=%s DIS_PROGRAM=%s "
+              "PRIV_MASK=%s FUSEWDATA_PLM=%s"
+              % (word(m["crc"], "0x%02x"), word(m["dsov"], "%d"),
+                 word(m["debugctrl"], "0x%x"), word(m["dis_program"], "%d"),
+                 word(m["priv_mask"]), word(m["plm_fuse_wdata"])))
+        if m["iff_window"]:
+            print("    IFF window rows %d-%d (from IFF_RECORD): the FF pool ends "
+                  "at row %d" % (m["iff_window"][0], m["iff_window"][1],
+                                 m["iff_window"][0] - 1))
 
 
 def _print_media(rep):
@@ -150,10 +230,17 @@ def _print_media(rep):
               % (disp["status"], disp["disp_head"]))
     sw = media.get("sw_override") or {}
     if sw.get("read"):
-        print("  software override: %s (FUSE_EN_SW_OVERRIDE=0x%x, DSOV/"
-              "FUSE_DIS_SW_OVR 0x820084=0x%x) -> %s"
+        # Scoped to the floorsweep route on purpose: what is inert here is the
+        # CTRL_OPT_* path guarded by FUSE_EN_SW_OVERRIDE. The 0x8238xx feature
+        # override island (compute rate, ECC, geometry) is a different
+        # mechanism, is written by the host unlocker every boot, and is
+        # emphatically not inert -- see the [Runtime state] section.
+        print("  floorsweep override (CTRL_OPT_*): %s (FUSE_EN_SW_OVERRIDE=0x%x,"
+              " DSOV/FUSE_DIS_SW_OVR 0x820084=0x%x) -> %s"
               % ("INERT" if sw["dead"] else "available", sw["en"], sw["dsov"],
-                 "burning FF records is the only lever" if sw["dead"]
+                 "FF records are the only lever for these bits (the 0x8238xx "
+                 "feature-override island is a separate mechanism and is live)"
+                 if sw["dead"]
                  else "volatile CTRL_OPT_* writes may work, but they do not "
                       "survive a reset"))
 

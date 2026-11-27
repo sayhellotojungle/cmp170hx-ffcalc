@@ -1,7 +1,13 @@
 from dataclasses import dataclass
 
 FF_ROW_MIN = 222
-FF_ROW_MAX = 486
+# Where the IFF window starts is hardware state, not folklore: a factory
+# CMP 170HX reads IFF_RECORD (0x00820050) as 0x01fb01e8, i.e. start
+# 0x1e8 = 488, last 0x1fb = 507 (read on two cards). The FF pool ends where
+# that window begins, so row 487 is writable and 488 is not.
+IFF_ROW_MIN = 488
+IFF_ROW_MAX = 507
+FF_ROW_MAX = IFF_ROW_MIN - 1
 # Physical fuse array: every row a snapshot or a rows file may name.
 PHYS_ROW_MIN = 0
 PHYS_ROW_MAX = 511
@@ -83,10 +89,12 @@ FIELDS = [
     # since hardware computes STATUS_OPT = OPT | DEFECTIVE, that equality says
     # every unit is there with no defects (the community card adds the PTOP
     # side: NV_PTOP_DEVICE_INFO2 slots go from all-zero to 5 NVDEC + NVJPG0 +
-    # OFA0 once the bits are clear). The cheap software route is dead on
-    # datacenter GA100 (FUSE_EN_SW_OVERRIDE 0x820040 = 0, and the community
-    # checks found volatile writes to the CTRL_OPT_*/OPT_* words inert even
-    # inside Goldilocks), which is why an FF record is the only lever. opt_in
+    # OFA0 once the bits are clear). The volatile route for these floorsweep
+    # bits is inert on datacenter GA100: FUSE_EN_SW_OVERRIDE (0x820040) = 0, and
+    # writes to the CTRL_OPT_*/OPT_* words never moved STATUS_OPT_*, even inside
+    # the burn window -- which is why an FF record is the only lever for them.
+    # (Scoped to this route: the 0x8238xx feature-override island is a separate
+    # mechanism and is written every boot; see analyze.runtime_state.) opt_in
     # for all three: the default plan does not touch one bit of them, --mig
     # asks.
     OptionField("nvdec_disable", "NV_FUSE_OPT_NVDEC_DISABLE",

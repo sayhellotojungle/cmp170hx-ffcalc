@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ffcalc import burntool, cli, ffmacro
+from ffcalc import burntool, cli, ffmacro, ffrows
 from ffcalc.dump import load_dump
 
 
@@ -22,7 +22,14 @@ class BurnBar(object):
         self.data = 0
         self.wdata = 0
         self.reg = {ffmacro.FUSEDEBUG: debug, ffmacro.CRC_STATUS: crc,
-                    ffmacro.EFP_STATUS: efp, ffmacro.DSOV_STATUS: dsov,
+                    ffmacro.EFP_STATUS: efp, ffmacro.DIS_PROGRAM: 0,
+                    ffmacro.DSOV_STATUS: dsov,
+                    # Both privilege words read fully open on a card whose
+                    # unlocker has opened them; a glitch that leaves PRIV_MASK
+                    # short of that is the near-miss class, not a window.
+                    ffmacro.PRIV_MASK: 0xFFFFFFFF,
+                    ffmacro.PLM_FUSE_WDATA: 0xFFFFFFFF,
+                    ffmacro.IFF_RECORD: 0x01FB01E8,
                     ffmacro.SBFE_SHADOW: 1,
                     ffmacro.WDATA_WR_SECURE: 1}
         self.poison_row = poison_row
@@ -144,6 +151,68 @@ class TestBurnOps(unittest.TestCase):
             ffmacro.program_row(bar.rd, bar.wr, 315, 0x420004C1,
                                 sleep=noop, clock=zero_clock)
         self.assertIn("cold-boot", str(cm.exception))
+
+
+class TestSwiffAndRowGuard(unittest.TestCase):
+    """SW-IFF rehearsal and the row guard: neither can destroy anything, so
+    they belong next to the burn path they are the careful alternative to."""
+
+    def setUp(self):
+        self.bar = BurnBar(rows={290: 0x429004C1})
+
+    def test_iff_window_comes_from_the_card(self):
+        # 0x01fb01e8: start 0x1e8, last 0x1fb. Read off factory cards, and the
+        # reason the FF pool stops at 487.
+        self.assertEqual(ffmacro.iff_window(self.bar.rd), (488, 507))
+
+    def test_swiff_applies_every_record_without_burning_anything(self):
+        applied = ffmacro.swiff_apply(self.bar.rd, self.bar.wr,
+                                      [0x00000141, 0x00000181],
+                                      sleep=noop, clock=zero_clock)
+        self.assertEqual(applied, [(488, 0x00000141), (489, 0x00000181)])
+        self.assertEqual(self.bar.rows, {290: 0x429004C1})   # nothing burnt
+        self.assertEqual(self.bar.programs, [])              # no PROGRAM command
+        self.assertEqual(self.bar.reg[ffmacro.EN_SW_OVERRIDE], 1)
+        self.assertEqual(self.bar.reg[ffmacro.IFF_SW_FUSING], 1)
+        self.assertEqual(self.bar.reg[ffmacro.IFF_RECORD], (489 << 16) | 489)
+
+    def test_swiff_avoids_a_window_row_that_is_already_used(self):
+        applied = ffmacro.swiff_apply(self.bar.rd, self.bar.wr, [0x11110141],
+                                      rows={488: 0x12345678},
+                                      sleep=noop, clock=zero_clock)
+        self.assertEqual(applied, [(489, 0x11110141)])
+
+    def test_swiff_refuses_outside_the_write_window(self):
+        self.bar.reg[ffmacro.DSOV_STATUS] = 1
+        with self.assertRaises(ffmacro.FuseControllerError) as cm:
+            ffmacro.swiff_apply(self.bar.rd, self.bar.wr, [0x1])
+        self.assertIn("cannot SW-IFF", str(cm.exception))
+
+    def test_near_miss_state_is_not_a_window(self):
+        """DSOV at 0 with the privilege mask short of fully open is the glitch
+        near-miss class: a write would be dropped, so it is not a window. DSOV
+        on its own is not the test."""
+        self.bar.reg[ffmacro.PRIV_MASK] = 0xFFFFFEFE
+        self.assertTrue(any("PRIV_MASK" in p
+                            for p in ffmacro.window_problems(self.bar.rd)))
+        self.assertFalse(ffmacro.in_write_window(ffmacro.status(self.bar.rd)))
+
+    def test_program_row_refuses_rows_outside_the_ff_pool(self):
+        # Rows 0-221 are factory OTP, 488-507 is the IFF window, and an all-ones
+        # write to row 0 or 1 is a known dead card. The guard has to be in the
+        # one function that issues CMD_PROGRAM, not only in the planner.
+        for row in (0, 1, 221, 488, 507, 511):
+            with self.assertRaises(ffmacro.FuseControllerError) as cm:
+                ffmacro.program_row(self.bar.rd, self.bar.wr, row, 0x420004c1,
+                                    sleep=noop, clock=zero_clock)
+            self.assertIn("outside the FF pool", str(cm.exception))
+
+    def test_last_pool_row_is_programmable(self):
+        ffmacro.arm(self.bar.rd, self.bar.wr)
+        got = ffmacro.program_row(self.bar.rd, self.bar.wr, 487, 0x12345678,
+                                  sleep=noop, clock=zero_clock)
+        self.assertEqual(got, 0x12345678)
+        self.assertEqual(self.bar.rows[487], 0x12345678)
 
 
 class TestBurnTool(unittest.TestCase):
@@ -311,7 +380,7 @@ class TestCaptureSnapshotEndToEnd(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         base = load_dump(self.SAMPLE)
         ff = dict((r, v) for r, v in base["ff_rows"].items()
-                  if 222 <= r <= 486)
+                  if ffrows.FF_ROW_MIN <= r <= ffrows.FF_ROW_MAX)
         card = os.path.join(tmp, "card.json")
         rows = dict(("%d" % r, "0x%08x" % v) for r, v in sorted(ff.items()))
         for r in range(222):        # a capture lists the whole array, so the

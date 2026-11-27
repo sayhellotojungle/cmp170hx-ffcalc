@@ -21,15 +21,27 @@ retry blindly.
 """
 import time
 
+from .optionmap import FF_ROW_MAX, FF_ROW_MIN, IFF_ROW_MAX, IFF_ROW_MIN
+
 FUSECTRL = 0x00820000
 FUSEADDR = 0x00820004
 FUSEDATA = 0x00820008
 FUSEWDATA = 0x0082000C    # record WRITE port (FUSEDATA is read-only)
-FUSEDEBUG = 0x00820060
+FUSEDEBUG = 0x00820060    # community name DEBUGCTRL; bit 1 = RWL, which the
+                          # community map says selects the RIR macro, so a
+                          # non-zero word would send an FF record to rows 0-7
+                          # (not reproduced here). The assertion is simply that
+                          # the whole word reads 0 before arming.
+EN_SW_OVERRIDE = 0x00820040
+IFF_RECORD = 0x00820050   # IFF window: start = v & 0x1ff, last = (v >> 16) & 0x1ff
 PMC_BOOT_0 = 0x00000000
 CRC_STATUS = 0x00820070   # 0x55 = healthy chain CRC
 EFP_STATUS = 0x00820078   # expect 1 before arming
+DIS_PROGRAM = 0x0082007C  # expect 0; a 1 disables all programming
 DSOV_STATUS = 0x00820084  # expect 0 inside the write window
+IFF_SW_FUSING = 0x00820088  # write 1 to apply an IFF record for this boot
+PLM_FUSE_WDATA = 0x008200F4  # FUSEWDATA privilege; 0xffffffff once unlocked
+PRIV_MASK = 0x008200FC    # general privilege mask; holds the SBFE PLM as well
 SBFE_SHADOW = 0x00821108  # writable while DSOV == 0
 WDATA_WR_SECURE = 0x0082048C  # write 0 -> PLM_FUSE auto-unlocks (0xffffffff)
 
@@ -133,16 +145,58 @@ def status(rd):
     return {"PMC_BOOT_0": rd(PMC_BOOT_0), "FUSECTRL": rd(FUSECTRL),
             "FUSEADDR": rd(FUSEADDR), "FUSEDATA": rd(FUSEDATA),
             "FUSEDEBUG": rd(FUSEDEBUG), "CRC_STATUS": rd(CRC_STATUS),
-            "EFP_STATUS": rd(EFP_STATUS), "DSOV_STATUS": rd(DSOV_STATUS),
+            "EFP_STATUS": rd(EFP_STATUS), "DIS_PROGRAM": rd(DIS_PROGRAM),
+            "DSOV_STATUS": rd(DSOV_STATUS), "IFF_RECORD": rd(IFF_RECORD),
+            "EN_SW_OVERRIDE": rd(EN_SW_OVERRIDE),
+            "PLM_FUSE_WDATA": rd(PLM_FUSE_WDATA), "PRIV_MASK": rd(PRIV_MASK),
             "SBFE_SHADOW": rd(SBFE_SHADOW),
             "WDATA_WR_SECURE": rd(WDATA_WR_SECURE)}
 
 
+def window_problems(rd):
+    """[] when the card is inside the burn window; else the reasons why not.
+
+    This is the un-armed half of the picture: nothing here has been written,
+    so it is safe to call on any card at any time. The privilege mask is
+    included because a glitch that clears DSOV without opening it is the
+    near-miss class, not a usable window: DSOV alone is not the test.
+    """
+    problems = []
+    ctrl = rd(FUSECTRL)
+    if is_poisoned(ctrl):
+        return ["controller poisoned (FUSECTRL=0x%08x): stop, cold boot" % ctrl]
+    if not is_idle(ctrl):
+        problems.append("FUSECTRL not idle (0x%08x)" % ctrl)
+    if rd(FUSEDEBUG) != 0:
+        problems.append("FUSEDEBUG/DEBUGCTRL=0x%x (must read 0; bit 1 RWL is "
+                        "reported to select the RIR macro instead of the FF one)"
+                        % rd(FUSEDEBUG))
+    if rd(CRC_STATUS) != 0x55:
+        problems.append("CRC_STATUS=0x%x (want 0x55)" % rd(CRC_STATUS))
+    if rd(EFP_STATUS) != 1:
+        problems.append("EFP_STATUS=%d (want 1)" % rd(EFP_STATUS))
+    if rd(DIS_PROGRAM) != 0:
+        problems.append("DIS_PROGRAM=%d (want 0: programming is disabled)"
+                        % rd(DIS_PROGRAM))
+    if rd(DSOV_STATUS) != 0:
+        problems.append("DSOV=%d (want 0: inside window)" % rd(DSOV_STATUS))
+    if rd(PRIV_MASK) != 0xFFFFFFFF:
+        problems.append("PRIV_MASK=0x%08x (want 0xffffffff: near-miss state, "
+                        "not a usable window)" % rd(PRIV_MASK))
+    return problems
+
+
 def in_write_window(st):
-    """All preconditions for arm/program, from a status() snapshot."""
+    """All preconditions for arm/program, from a status() snapshot.
+
+    A snapshot is only as fresh as the rd() behind it, so burntool calls this
+    again immediately before it arms; DIS_PROGRAM, the privilege mask and the
+    FUSEWDATA PLM are what turn "DSOV happens to read 0" into "a write will
+    actually land"."""
     return (is_idle(st["FUSECTRL"]) and not is_poisoned(st["FUSECTRL"])
             and st["FUSEDEBUG"] == 0 and st["CRC_STATUS"] == 0x55
-            and st["EFP_STATUS"] == 1 and st["DSOV_STATUS"] == 0)
+            and st["EFP_STATUS"] == 1 and st["DIS_PROGRAM"] == 0
+            and st["DSOV_STATUS"] == 0 and st["PRIV_MASK"] == 0xFFFFFFFF)
 
 
 def read_row(rd, wr, row, sleep=time.sleep, clock=time.monotonic):
@@ -185,26 +239,18 @@ def sense(rd, wr, sleep=time.sleep, clock=time.monotonic):
 
 def armed_problems(rd, wr):
     """[] when a PROGRAM command is allowed right now; else reasons."""
-    problems = []
-    ctrl = rd(FUSECTRL)
-    if is_poisoned(ctrl):
-        return ["controller poisoned (FUSECTRL=0x%08x): stop, cold boot"
-                % ctrl]
-    if not is_idle(ctrl):
-        problems.append("FUSECTRL not idle (0x%08x)" % ctrl)
-    if rd(FUSEDEBUG) != 0:
-        problems.append("FUSEDEBUG=0x%x" % rd(FUSEDEBUG))
-    if rd(CRC_STATUS) != 0x55:
-        problems.append("CRC_STATUS=0x%x (want 0x55)" % rd(CRC_STATUS))
-    if rd(EFP_STATUS) != 1:
-        problems.append("EFP_STATUS=%d (want 1)" % rd(EFP_STATUS))
-    if rd(DSOV_STATUS) != 0:
-        problems.append("DSOV=%d (want 0: inside window)" % rd(DSOV_STATUS))
+    problems = window_problems(rd)
+    if problems and (is_poisoned(rd(FUSECTRL)) or rd(DSOV_STATUS) != 0):
+        return problems          # not even in the window; arming is moot
     if rd(SBFE_SHADOW) != 0:
         problems.append("SBFE shadow=%d (want 0: armed)" % rd(SBFE_SHADOW))
     if rd(WDATA_WR_SECURE) != 0:
         problems.append("WDATA_WR_SECURE=%d (want 0: unlocked)"
                         % rd(WDATA_WR_SECURE))
+    if rd(PLM_FUSE_WDATA) != 0xFFFFFFFF:
+        problems.append("PLM_FUSE_WDATA=0x%08x (want 0xffffffff: the data path "
+                        "is still gated, FUSEWDATA writes would be dropped)"
+                        % rd(PLM_FUSE_WDATA))
     return problems
 
 
@@ -224,6 +270,12 @@ def program_row(rd, wr, row, record, sleep=time.sleep, clock=time.monotonic):
     readback. A row that already holds exactly this record is left untouched
     and returned, so re-running an interrupted burn is safe. Raises without
     programming if the row holds anything else."""
+    if not FF_ROW_MIN <= row <= FF_ROW_MAX:
+        raise FuseControllerError(
+            "refusing to program row %d: outside the FF pool %d-%d "
+            "(rows 0-%d are factory OTP, rows %d-%d are the IFF window)"
+            % (row, FF_ROW_MIN, FF_ROW_MAX, FF_ROW_MIN - 1,
+               IFF_ROW_MIN, IFF_ROW_MAX))
     problems = armed_problems(rd, wr)
     if problems:
         raise FuseControllerError("not armed before row %d: %s"
@@ -251,6 +303,88 @@ def program_row(rd, wr, row, record, sleep=time.sleep, clock=time.monotonic):
             "row %d verify mismatch: burned 0x%08x, reads back 0x%08x"
             % (row, record, got))
     return got
+
+
+def iff_window(rd):
+    """(first, last) row of the IFF window, decoded from the card's own word.
+
+    A factory card reads 0x01fb01e8, i.e. 488..507: the window is where the FF
+    pool stops, which is why FF_ROW_MAX is IFF_ROW_MIN - 1 and not a guess."""
+    v = rd(IFF_RECORD)
+    first, last = v & 0x1FF, (v >> 16) & 0x1FF
+    if not (0 <= first <= last < ROW_COUNT):
+        raise FuseControllerError(
+            "IFF_RECORD=0x%08x decodes to rows %d..%d: unusable window"
+            % (v, first, last))
+    return first, last
+
+
+def swiff_apply(rd, wr, records, rows=None, sleep=time.sleep,
+                clock=time.monotonic):
+    """Replay burn records as volatile IFF fuses for this boot (SW-IFF).
+
+    Same 32-bit records program_row would burn, placed instead in the IFF window
+    (rows 488-507 on a factory card, read from IFF_RECORD), so a cold boot takes
+    them back. `rows`, when given, is {row: value} for the window rows
+    (capture_rows covers them); a row that is not blank is skipped so an
+    existing record is never overwritten. Returns [(row, record)].
+
+    Needs the burn window exactly like a real burn: this writes, so DSOV == 0,
+    FUSEDEBUG == 0, the privilege mask open and EN_SW_OVERRIDE arming must all
+    hold. It is therefore not something to attempt on a card that is serving
+    traffic, and it never issues CMD_PROGRAM: no cell is burned on this path.
+
+    What the code does per record: arm EN_SW_OVERRIDE, aim IFF_RECORD at one row
+    (start and last both that row), latch FUSEADDR to it, write the record to
+    FUSEWDATA, then write IFF_SW_FUSING=1 to apply it, and restore FUSEADDR.
+
+    STATUS: never exercised on our hardware. The registers in the sequence have
+    all been read off both cards, and the sequence itself is tested against a
+    fake controller, but no IFF record has been applied on a real card from this
+    code yet -- so what the card does with the record (whether SM count, memory
+    size or link training follow it, as the recipe says they do) is the
+    recipe's claim, not a measurement, and the first person to run `burntool
+    swiff` is the one who verifies it.
+    """
+    problems = window_problems(rd)
+    if problems:
+        raise FuseControllerError("cannot SW-IFF: " + "; ".join(problems))
+    first, last = iff_window(rd)
+    want = list(records)
+    if not want:
+        return []
+    if len(want) > last - first + 1:
+        raise FuseControllerError(
+            "%d records do not fit the IFF window (rows %d..%d)"
+            % (len(want), first, last))
+    taken = []
+    wr(EN_SW_OVERRIDE, 1)
+    if rd(EN_SW_OVERRIDE) != 1:
+        raise FuseControllerError(
+            "EN_SW_OVERRIDE stayed 0x%x: the override cannot be armed here"
+            % rd(EN_SW_OVERRIDE))
+    for row in range(first, last + 1):
+        if len(taken) == len(want):
+            break
+        if (rows or {}).get(row, 0) != 0:
+            continue
+        orig = rd(FUSEADDR)
+        try:
+            wr(IFF_RECORD, (row << 16) | row)
+            wr(FUSEADDR, row)
+            if rd(FUSEADDR) != row:
+                raise FuseControllerError(
+                    "FUSEADDR did not latch IFF row %d" % row)
+            wr(FUSEWDATA, want[len(taken)])
+            wr(IFF_SW_FUSING, 1)
+        finally:
+            wr(FUSEADDR, orig)
+        taken.append((row, want[len(taken)]))
+    if len(taken) != len(want):
+        raise FuseControllerError(
+            "only %d of %d records found a blank IFF row in %d..%d"
+            % (len(taken), len(want), first, last))
+    return taken
 
 
 PROBE_C = """

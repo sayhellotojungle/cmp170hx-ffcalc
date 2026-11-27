@@ -62,6 +62,38 @@ N=$(grep -c '{ 0x' "$KDIR/ffprobe.c")
 FFROWS=${FFROWS:-1}
 if [ "$FFROWS" = "1" ]; then N=$((N + 512 + 1)); fi
 sudo make -C "$K" M="$PWD/$KDIR" modules >/dev/null
+
+# Loading the probe touches the fuse macro while the nvidia driver is attached.
+# Even a careful module is a bad idea under load: an insmod killed mid CMD_READ
+# can leave the controller non-idle, and one out-of-range readl (a table entry
+# past the ioremap length) has taken a host down. So the probe only goes in on
+# an idle card, and FORCE=1 has to be a decision, not a reflex.
+# Loading the probe touches the fuse macro while the nvidia driver is attached.
+# Even a careful module is a bad idea under load: an insmod killed mid CMD_READ
+# can leave the controller non-idle, and one out-of-range readl (a table entry
+# past the ioremap length) has taken a host down. Reading words is harmless;
+# the CMD_READ pass writes FUSEADDR/FUSECTRL, so it waits for a quiet card.
+if [ "${FORCE:-0}" != "1" ]; then
+	BUSY=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
+	      --format=csv,noheader 2>/dev/null | grep -c . || true)
+	if [ "${BUSY:-0}" != "0" ]; then
+		echo "refusing to run the probe: $BUSY compute process(es) on the GPUs" >&2
+		nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
+		        --format=csv,noheader >&2
+		echo "stop the workload first; FORCE=1 overrides only if you own the risk" >&2
+		exit 3
+	fi
+	# The host-side unlocker's keepers are not CUDA clients, so nvidia-smi shows
+	# nothing while they poke the card (cmp_hbm_pm logs "the keeper reports work
+	# on the card"). They do not block a word readout; they do block CMD_READ.
+	if [ "$FFROWS" = "1" ] && pgrep -f 'hbm-lease|gpu_unlock|cmpunlocker' >/dev/null 2>&1; then
+		echo "refusing the CMD_READ pass: an unlocker keeper is working on the card" >&2
+		pgrep -af 'hbm-lease|gpu_unlock|cmpunlocker' >&2
+		echo "FFROWS=0 to capture words only, or stop the keeper, or FORCE=1" >&2
+		exit 3
+	fi
+fi
+
 nvidia-smi --query-gpu=pci.bus_id,uuid --format=csv,noheader \
 	| tr 'A-F' 'a-f' | tr -d ' ' | sed 's/^00000000:/0000:/' \
 	> "$DIR/uuid.csv"

@@ -281,6 +281,87 @@ class TestDump(unittest.TestCase):
         self.assertFalse([r for r in obj["burn"] if r["block"] == 46])
 
 
+class TestRuntimeState(unittest.TestCase):
+    """The runtime half of the picture. Rate, ECC and geometry are registers the
+    driver-side unlocker rewrites every boot, not fuse outcomes, so `report`
+    keeps them in their own section and never lets a burnt fuse claim them."""
+
+    def setUp(self):
+        self.rt = analyze(load_dump(SAMPLE))["runtime"]
+
+    def test_compute_rate_is_runtime_not_fused(self):
+        self.assertTrue(self.rt["compute"]["full_rate_now"])
+        self.assertEqual(self.rt["compute"]["override"], [0x88888888, 0x8])
+        # 0x5 is the 1/32-rate select; ss_dp holds something else, so it is not
+        # listed as throttled. The FF pool does not carry any of these words.
+        self.assertEqual(self.rt["compute"]["fused_throttled"],
+                         ["ss_ffma", "ss_fmla16", "ss_fmla32", "ss_imla0",
+                          "ss_imla1", "ss_imla2", "ss_imla3", "ss_imla4"])
+
+    def test_ecc_separates_the_fuse_from_this_boot(self):
+        self.assertEqual(self.rt["ecc"]["fused"], 0)      # OPT_ECC_EN: not fused on
+        self.assertTrue(self.rt["ecc"]["dram_master"])    # ECC_CTRL bit 0
+        self.assertTrue(self.rt["ecc"]["dram_sideband"])  # ECC_CTRL bit 6: full size
+
+    def test_geometry_board_and_macro(self):
+        self.assertEqual(self.rt["geometry"]["mmu_lmr"], 0x28B)
+        self.assertEqual(self.rt["geometry"]["cstatus_ramamount"], 0x1000)
+        self.assertEqual(self.rt["macro"]["iff_window"], (488, 507))
+        # the macro words a burn decision rests on, read as a snapshot
+        self.assertEqual(self.rt["macro"]["crc"], 0x55)
+        self.assertEqual(self.rt["macro"]["efp"], 1)
+        self.assertEqual(self.rt["macro"]["wdata_wr_secure"], 1)
+        self.assertEqual(self.rt["macro"]["priv_mask"], 0xFFFFFFFF)
+        self.assertEqual(self.rt["board"]["hbm_mhz"], 1728)
+        self.assertIn("busy coefficient", self.rt["board"]["hbm_state"])
+        self.assertTrue(self.rt["board"]["gfw_clean"])
+
+    def test_hbm_coeff_is_power_management_not_a_fuse_state(self):
+        """The same card reads 0x14001 under traffic and 0x11401 idle; only the
+        MHz figure is worth printing, and it has to follow the word."""
+        dump = load_dump(SAMPLE)
+        dump["info"]["hbm_pll_coeff"] = 0x00011401
+        board = analyze(dump)["runtime"]["board"]
+        self.assertEqual(board["hbm_mhz"], 540)
+        self.assertIn("downclocked", board["hbm_state"])
+
+    def test_report_prints_the_runtime_section(self):
+        rc, out = quiet(["report", SAMPLE])
+        self.assertEqual(rc, 0)
+        for needle in ("[Runtime state", "no throttle bit set",
+                       "IFF window rows 488-507", "1728 MHz",
+                       "speed selects reading 0x"):
+            self.assertIn(needle, out)
+
+    def test_a_snapshot_without_the_words_says_so(self):
+        dump = load_dump(SAMPLE)
+        for key in ("feat_readout_1", "feat_ovr_sm_spd_0", "feat_ovr_sm_spd_1",
+                    "ss_dp", "ss_ffma", "ss_fmla16", "ss_fmla32", "ss_imla0",
+                    "ss_imla1", "ss_imla2", "ss_imla3", "ss_imla4",
+                    "ecc_ctrl", "opt_ecc_en", "iff_record", "hbm_pll_coeff",
+                    "crc_status", "efp_status", "wdata_wr_secure",
+                    "priv_mask", "plm_fuse_wdata", "dsov_status",
+                    "fuse_debugctrl", "dis_program"):
+            dump["info"].pop(key)
+        rt = analyze(dump)["runtime"]
+        self.assertNotIn("compute", rt)
+        self.assertNotIn("ecc", rt)
+        self.assertIsNone(rt["macro"]["iff_window"])
+        self.assertIsNone(rt["macro"]["crc"])
+        self.assertIsNone(rt["board"]["hbm_mhz"])
+        # A missing word must not be printed as 0: an all-zero CRC line reads
+        # like a dead chain, and DSOV/PRIV_MASK at 0 read like a burn window.
+        snap = tempfile.mktemp(suffix=".json")
+        with open(snap, "w") as f:
+            json.dump(dump, f)
+        self.addCleanup(os.remove, snap)
+        rc, out = quiet(["report", snap])
+        self.assertEqual(rc, 0)
+        self.assertIn("CRC=not read", out)
+        self.assertIn("PRIV_MASK=not read", out)
+        self.assertNotIn("CRC=0x00 ", out)
+
+
 class TestMediaUnlock(unittest.TestCase):
     """`--mig`: the Chain-1 floorsweep bits on NVDEC/NVJPG/OFA.
 
@@ -323,9 +404,11 @@ class TestMediaUnlock(unittest.TestCase):
                      "STATUS_OPT_*"):
             self.assertIn(must, warn)
         # what comes out of burning them, including what stays impossible
-        for must in ("5x NVDEC", "no AV1", "NVJPG0", "OFA0", "8g/4g/2g/1g",
-                     "7g"):
+        for must in ("5x NVDEC", "no AV1", "NVJPG0", "OFA0", "8g/4g/2g/1g"):
             self.assertIn(must, warn)
+        # the inert route is named as *this* route only: the 0x8238xx island is
+        # live, and the warning may not blur the two
+        self.assertIn("feature-override island", warn)
         # what this does not prove, and the MIG-mode reboot trap
         for must in ("does NOT prove", "bit146/bit371", "ECC", "REBOOT"):
             self.assertIn(must, warn)
@@ -451,7 +534,7 @@ class TestMediaUnlock(unittest.TestCase):
         self.assertIn("[MIG / media engines]", out)
         self.assertIn("NVDEC  0/5 live now -> unchanged", out)
         self.assertIn("--mig", out)
-        self.assertIn("software override: INERT", out)
+        self.assertIn("floorsweep override (CTRL_OPT_*): INERT", out)
         self.assertIn("DISPLAY/DISP_HEAD", out)
 
     def test_gen_mig_cli(self):
@@ -534,11 +617,11 @@ class TestFfRowsParsing(unittest.TestCase):
             "0xde 0xfe805c1\n"
             "FFROW 223 141\n"
             "[ 1569.145419] FFROW 224 0x19801c1   # trailing comment\n"
-            "486 0\n")
+            "%d 0\n" % ffrows.FF_ROW_MAX)
         self.assertEqual(rows[222], 0x0fe805c1)
         self.assertEqual(rows[223], 141)
         self.assertEqual(rows[224], 0x19801c1)
-        self.assertEqual(rows[486], 0)
+        self.assertEqual(rows[ffrows.FF_ROW_MAX], 0)
 
     def test_bad_lines(self):
         with self.assertRaises(ValueError):
@@ -556,7 +639,7 @@ class TestFfRowsParsing(unittest.TestCase):
         self.assertEqual(ffrows.coverage({"ff_rows": {"0": 5}})[0], "missing")
         self.assertEqual(ffrows.coverage({"ff_rows": {"222": 1}})[0],
                          "partial")
-        full = dict((r, 0) for r in range(222, 487))
+        full = dict((r, 0) for r in range(ffrows.FF_ROW_MIN, ffrows.FF_ROW_MAX + 1))
         self.assertEqual(ffrows.coverage({"ff_rows": full})[0], "complete")
 
 
@@ -587,7 +670,7 @@ class TestMergeffCli(unittest.TestCase):
         partial = os.path.join(self.tmp, "partial.txt")
         with open(partial, "w") as f:
             for r, v in sorted(self.dump["ff_rows"].items()):
-                if r != 486:
+                if r != ffrows.FF_ROW_MAX:
                     f.write("%s %s\n" % (r, v))
         rc = cli.main(["mergeff", self.card, partial])
         self.assertEqual(rc, 1)
@@ -601,7 +684,7 @@ class TestMergeffCli(unittest.TestCase):
 
         `capture.py` writes row values as `"0x%08x"` strings, `ingest` writes
         ints, and both are legal snapshots. An external rows file normally
-        covers only the FF region (222-486), so mergeff has to carry every row
+        covers only the FF region (222-487), so mergeff has to carry every row
         outside it through unchanged. Carrying them through *unexamined* is
         what crashed mergeff with `"0x%08x" % "0x00000000"` (real card,
         2026-11-24); merely writing them back without checking is what would
@@ -623,7 +706,7 @@ class TestMergeffCli(unittest.TestCase):
         # gives the merged rows plus the rows that were already there, as-is.
         rows = load_dump(card)["ff_rows"]
         ff = dict((r, v) for r, v in self.dump["ff_rows"].items()
-                  if 222 <= r <= 486)
+                  if ffrows.FF_ROW_MIN <= r <= ffrows.FF_ROW_MAX)
         self.assertEqual(dict((r, rows[r]) for r in ff), ff)
         self.assertEqual(dict((r, rows[r]) for r in outside), outside)
         # Idempotent: the file mergeff wrote is a snapshot mergeff can read
@@ -753,9 +836,14 @@ class FakeMmap(object):
     CMD_READ: a command write to FUSECTRL completes at once and FUSEDATA
     answers with f(FUSEADDR)."""
 
-    def __init__(self, words=()):
+    def __init__(self, words=(), size=capture.BAR0_LEN):
         self.words = dict(words)
         self.pos = 0
+        self.size = size
+
+    def __len__(self):
+        return self.size      # a real mmap reports the mapped length; rd()/wr()
+                              # bounds-check against it
 
     def seek(self, off):
         self.pos = off

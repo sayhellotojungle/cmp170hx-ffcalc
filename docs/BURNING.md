@@ -1,122 +1,190 @@
-# FF 熔丝烧写实录与操作规程（实卡闭环验证）
+# FF 熔丝烧写操作规程
 
-> **⚠ 刷卡有风险：不可逆，最坏后果整卡报废。只有在你能接受最坏后果的前提下才动手操作。每一步谨慎、谨慎、再谨慎；数据必须交叉核对（burn 前 `verify`+`sim`+现场逐行对快照只是本工具自带的三道闸，建议再用独立工具/另一张参考卡比一遍），多找几个工具对比，全部对上了才允许 PROGRAM。**
+熔丝烧写**物理不可逆**，错误目标值最坏导致整卡报废。本文件是 `python -m ffcalc.burntool` 的执行依据：寄存器与命令值、写窗口判据、断言顺序、锁死恢复、熔丝与运行时状态的边界。所有数值均为本仓库在自己卡上读出的实测值；未实测的项目在标题或正文中明确标注，不作为依据。
 
-本文是 `python -m ffcalc.burntool` 的操作规程：寄存器与命令（全部实机确认）、烧写流程与断言清单、错误锁死后的恢复、以及一张 CMP 170HX 从破解到烧完的完整闭环记录。硬件侧（glitch 台架、窗口获取）见姊妹项目 [esp32-ga100vfi](https://github.com/…/esp32-ga100vfi) README。
+> 三道闸缺一不可：`ffcalc verify`（UUID / fingerprint / 回放）、burntool 的离线核验（行占用、old 值、重编码、FF 范围）、烧写现场逐行回读对快照。任何一道不满足即停止，不允许绕过。
 
-## 1. 寄存器与命令（实机确认值）
+## 1. 熔丝阵列地址空间
 
-| 寄存器 | BAR0 偏移 | 说明 |
-|---|---|---|
-| `FUSECTRL` | `0x00820000` | 命令/状态。状态字段 = bits[20:16]；IDLE=4（`0xE0040000`）。命令 = 低 5 位直写 |
-| `FUSEADDR` | `0x00820004` | 行号锁存；任何读/写行之前写它，读完恢复 |
-| `FUSEDATA` | `0x00820008` | **只读**数据口。往这里写记录会静默丢失（实踩） |
-| `FUSEWDATA` | `0x0082000C` | **记录写入口**。PROGRAM 前写这里 |
-| `FUSEDEBUG` | `0x00820060` | 必须为 0 |
-| `CRC_STATUS` | `0x00820070` | 健康 = `0x55`；烧写后仍 `0x55`（CRC 由控制器自动重算，已实测） |
-| `EFP_STATUS` | `0x00820078` | 期望 1 |
-| `DSOV_STATUS` | `0x00820084` | 写窗口内 = 0 |
-| `SBFE_SHADOW` | `0x00821108` | SBFE 影子位，**DSOV=0 时可写**（写 0 = 授权烧写）。冷启动后恢复 1 |
-| `WDATA_WR_SECURE` | `0x0082048C` | 写 0 → `PLM_FUSE(0x8200F4)` 自动放开（自动读 `0xffffffff`）。**别直写 PLM**（写不进，实踩） |
+| 行区间 | 性质 |
+|---|---|
+| 0–221 | 出厂 OTP。只读，**禁止写入** |
+| 222–487 | FF 池（266 行），烧写计划唯一允许使用的区间 |
+| 488–507 | IFF 窗口（易失，冷启动失效） |
+| 508–511 | 未使用 |
 
-| 命令（写 FUSECTRL 低 5 位） | 值 | 实测行为 |
-|---|---|---|
-| `CMD_READ` | 1 | 读 `FUSEDATA`；**未烧行读 0x00000000**（kate 的 rows 转写里是 `-`，本仓库按 0 处理，正确） |
-| `CMD_PROGRAM` | 2 | **实机确认**。瞬时状态 `0xE00C0000`（WRITE_PROGRAM, state=3），约 1 ms 回 IDLE |
-| `CMD_SENSE` | 3 | 重新解析 OTP→影子，保留 DSOV；冷启动/PEX_RST 后第一步就该发它。社区报告称它**只重新感测 control rows 0–1、不刷新 FF 池**（我们这轮是直接冷启动，没验过 SENSE 后 FF 层是否更新），所以刚烧完想在免驱态读新烧的 FF 行，按冷启动或 bus reset 后重映射 BAR0 处理，别把 `0x00000000` 当成烧坏了 |
+- 上界来源：卡自己上报 `IFF_RECORD(0x820050) = 0x01fb01e8` → start `0x1e8`=488、last `0x1fb`=507。FF 池到 `IFF_ROW_MIN - 1` = 487 为止，不是估值。
+- `ffmacro.program_row()` 对行号做硬断言，区间外的行一律拒绝；这层保护独立于计划生成器。
+- 禁止写入清单：行 0 与行 1。外部报告称对这两行写全 1 会使融合控制器永久锁死；该后果不去验证，规则按禁止执行，代码层同样拒绝。
+- 熔丝只能 0→1。同一链内后写的记录覆盖先写的记录，因此新记录必须追加在该卡最后一条已烧行之后。
 
-`PEX_RST`（冷启动或平台复位脉冲）会让卡**重新解析 FF**（等价于完整冷启动），是烧写后免断电的快速验证手段。
-
-## 2. 烧写窗口
-
-烧写只允许在**卡从未被 PCIe 枚举**时进行：VFI/glitch 上电 + PEX_RST 脉冲 → 驱动未绑定 → `DSOV=0`。枚举过的卡必须整机断电（不是 warm reboot）回到该状态。窗口判据（`ffmacro.in_write_window`）：
+## 2. FF 记录格式
 
 ```
-FUSECTRL idle(4) ∧ FUSEDEBUG=0 ∧ CRC_STATUS=0x55 ∧ EFP=1 ∧ DSOV=0
+bits[4:0]  = chain        bits[5] = 0 (FF)
+bits[15:6] = 16-bit 块号   bits[31:16] = 块的新值
 ```
 
-## 3. 烧写流程（burntool 自动执行，逐条断言）
+例：`0x0fe805c1` = chain1 / block23 / data `0x0fe8`。记录写的是**整个 16-bit 块**，所以一条记录的行代价取决于本轮是否本来就要重写该块。
 
-1. **先读计划自己**：burntool 打印 `plan["warnings"]`（若含熔丝 devid 改写，还会额外一条 `NOTICE`：后面欠一次 A100 vBIOS 刷写，POST 挂死只剩 CH341A），这些必须在 `YES` 之前看到。
-2. **离线核验**（不碰卡）：`simulate(plan, dump)` 必须 0 错误 —— 记录重编码、行占用、old==快照回放、目标行空白、FF 范围。官方 `ffcalc verify --dir collected` 现场再验一次 UUID/fingerprint。在此之前两个输入文件本身必须可解析：计划缺少 `burn` 列表，或快照任一行不合法（行号越界、值超出 32 位、JSON 不完整、同一行两个值），一律 `REFUSED` 且**卡未被写入**（rc=1）。快照无法解析即无从得知该行当前内容，不具备烧写条件。
-3. `YES`：确认发生在警告与离线核验**之后**——先让人看到风险，再问要不要动手。
-4. `status`：确认在写窗口内、控制器未因失败锁死。
-5. `CMD_SENSE`：完成后 DSOV 必须仍为 0，否则**不烧**。
-6. **现场逐行对快照**：计划涉及的每一行 CMD_READ 回读，必须与 dump 的 `ff_rows` 一致（防错卡/防中途被烧）。
-7. `arm`：写 `SBFE_SHADOW=0`、`WDATA_WR_SECURE=0`，断言 `armed_problems()==[]`（idle/debug/CRC/EFP/DSOV/SBFE/WSEC 七项）。
-8. 每条记录：`program_row` = 断言已授权 → 目标行读 0 → 锁行校验 → 写 `FUSEWDATA` → `CMD_PROGRAM` → 等 IDLE（≤10 s）→ **回读必须等于记录值**。任何一条不符立即中止。目标行若**已经恰好等于该记录值**（上次中断已烧成）则原样跳过——中断后直接重跑同一计划是安全的。
-9. 收尾：再读 `status`（CRC 应仍 `0x55`），冷启动，重跑 `ffscan.sh`：fingerprint 的 defective 部分不变（SBFE 位翻转为 1 属预期），剩余计划应显著缩短/为空。
+## 3. 寄存器（实测值）
 
-**首次试烧**建议 `--rows <单行>`（如 fbp 那条），验证 PROGRAM 行为与 CRC 自补后再上全量——本次实测就是这么做的（315 行先烧，`0x420004c1` 一次成功）。
+| 寄存器 | BAR0 偏移 | 健康态读数 / 说明 |
+|---|---|---|
+| `FUSECTRL` | `0x820000` | 命令/状态。状态 = bits[20:16]，IDLE=4（`0xE0040000`）；命令 = 低 5 位直写 |
+| `FUSEADDR` | `0x820004` | 行号锁存；读写行之前写入，结束后恢复原值 |
+| `FUSEDATA` | `0x820008` | **只读**数据口；向它写记录会静默丢失 |
+| `FUSEWDATA` | `0x82000c` | 记录写入口，PROGRAM 之前写这里 |
+| `IFF_RECORD` | `0x820050` | `0x01fb01e8`：IFF 窗口 488–507 |
+| `EN_SW_OVERRIDE` | `0x820040` | 0（出厂）；`CTRL_OPT_*` floorsweep 覆盖路的总开关 |
+| `FUSEDEBUG` | `0x820060` | 必须为 0。bit1 = RWL，文献记为 RIR 宏选择位（为 1 时 FF 记录会以 RIR 写入落到行 0–7；该后果本仓库未复现，判据按整字必须为 0 执行） |
+| `CRC_STATUS` | `0x820070` | `0x55` = 链 CRC 健康；烧写后仍为 `0x55`，CRC 由控制器自动重算 |
+| `EFP_STATUS` | `0x820078` | 1 |
+| `DIS_PROGRAM` | `0x82007c` | 0；为 1 表示编程被禁止 |
+| `DSOV_STATUS` | `0x820084` | 写窗口内 = 0；驱动在场时 = 1（同一字在 floorsweep 文献里叫 `FUSE_DIS_SW_OVR`） |
+| `IFF_SW_FUSING` | `0x820088` | 写 1 使一条 IFF 记录在本次启动生效 |
+| `PLM_FUSE_WDATA` | `0x8200f4` | `0xffffffff` = `FUSEWDATA` 通路已放开；未放开时写入被丢弃 |
+| `PRIV_MASK` | `0x8200fc` | `0xffffffff` = 权限放开（含 SBFE PLM）；不满即为近失状态，不构成可用窗口 |
+| `SBFE_SHADOW` | `0x821108` | 授权影子位，`DSOV=0` 时可写，写 0 = 授权烧写；冷启动恢复为 1 |
+| `WDATA_WR_SECURE` | `0x82048c` | 写 0 → `PLM_FUSE_WDATA` 自动读 `0xffffffff`。直接写 PLM 无效 |
+| `MAGIC_BITS_D` | `0x820520` | `0x14680000`（CMP 170HX）：PCIe **能力宣告**字，不代表实际速率 |
 
-## 4. 控制器错误锁死（poison）与恢复
+| 命令（`FUSECTRL` 低 5 位） | 值 | 行为 |
+|---|---|---|
+| `CMD_READ` | 1 | 读 `FUSEDATA`；未烧行读 `0x00000000` |
+| `CMD_PROGRAM` | 2 | 烧一条记录；瞬时状态 `0xE00C0000`（state=3），随后回 IDLE |
+| `CMD_SENSE` | 3 | 重新解析 OTP→影子，保留 DSOV；冷启动或 PEX_RST 之后第一步执行 |
 
-任何命令失败后 `FUSECTRL` 停在 `0xBADFxxxx`（state=31），控制器**不再应答任何 BAR0 读**。规则：
+`PEX_RST`（冷启动或平台复位脉冲）使卡重新解析 FF 记录，效果等同完整冷启动，是烧写后免断电的复核手段。
 
-1. 看到 `0xBADF` 前缀立刻**停止一切读**（继续读会加深状态）；
+## 4. 写窗口判据
+
+未授权状态（任何卡、任何时刻都可安全检查，对应 `ffmacro.window_problems()`）：
+
+```
+FUSECTRL idle ∧ ¬poisoned ∧ FUSEDEBUG = 0 ∧ CRC_STATUS = 0x55 ∧ EFP_STATUS = 1
+∧ DIS_PROGRAM = 0 ∧ DSOV = 0 ∧ PRIV_MASK = 0xffffffff
+```
+
+授权状态（允许 `CMD_PROGRAM`，对应 `ffmacro.armed_problems()`，在上面基础上追加）：
+
+```
+∧ SBFE_SHADOW = 0 ∧ WDATA_WR_SECURE = 0 ∧ PLM_FUSE_WDATA = 0xffffffff
+```
+
+`DSOV = 0` 单独不构成写窗口：清掉 DSOV 而 `PRIV_MASK` 未放开的近失状态下写入会被丢弃，必须连同权限位一起判定。烧写只允许在卡**从未被 PCIe 枚举**时进行（VFI/glitch 上电 + PEX_RST 脉冲，驱动未绑定）；已被枚举过的卡必须整机断电（不是 warm reboot）回到该状态。
+
+## 5. 烧写流程
+
+`burntool burn` 强制以下顺序，任一步失败即中止且不写卡：
+
+1. **回显计划自带的 `warnings`**。计划含身份改写时额外打印 `NOTICE`：冷启动后卡自认 A100，后续欠一次 vBIOS 刷写，平台 POST 失败只能离线刷 SPI。
+2. **离线核验**（不碰卡）：`simulate(plan, dump)` 必须 0 错误——记录重编码、行占用、`old` 与快照回放一致、目标行空白、行号在 FF 池内。输入文件本身必须可解析；计划缺 `burn` 或快照任一行非法（行号越界、值超 32 位、同一行两个值、JSON 不完整）即 `REFUSED`，且文件未被修改。
+3. **`YES` 确认**，位于警告与离线核验之后。
+4. **窗口判据**（§4 未授权状态）复检，控制器不得处于锁死。
+5. **`CMD_SENSE`**，完成后 `DSOV` 仍必须为 0。
+6. **现场逐行对快照**：计划涉及的每一行 `CMD_READ` 回读必须与 `dump["ff_rows"]` 一致。
+7. **`arm`**：写 `SBFE_SHADOW=0`、`WDATA_WR_SECURE=0`，断言 §4 授权状态全部成立。
+8. **逐条 `program_row`**：断言已授权 → 目标行读 0 → 锁行校验 → 写 `FUSEWDATA` → `CMD_PROGRAM` → 等 IDLE（≤10 s）→ 回读必须等于记录值。目标行已恰好等于该记录值（上次中断已烧成）时原样跳过，因此中断后重跑同一计划是安全的。
+9. **收尾**：再读一次状态（`CRC_STATUS` 应仍 `0x55`），冷启动，重跑 `scripts/ffscan.sh`：defective 指纹不变（SBFE 位翻为 1 属预期），剩余计划应显著缩短或为空。每轮烧写后旧计划作废。
+
+首次执行建议用 `--rows <单行>` 单条试烧（例如 `fbp_disable` 那条），确认 PROGRAM 行为与 CRC 自补之后再上全量。
+
+## 6. 预演：`burntool swiff`
+
+把计划的记录写进 IFF 窗口而不是烧进 FF 池，冷启动即全部消失；不发 `CMD_PROGRAM`，不消耗任何熔丝单元。窗口要求与 `burn` 相同（§4），窗口按 `IFF_RECORD` 读取，每条记录占一行，工厂卡为 488–507 共 20 行，超出该行数的计划必须分批。
+
+**本仓库尚未在实卡上执行过这条路径。** 序列中的每个寄存器都已从两张卡读出，序列本身有针对假控制器的单元测试，但卡收到 IFF 记录后的行为（SM 数、显存、链路是否随记录变化）属于外部报告的描述，不是本仓库的实测结论。首次执行即为验证：应用后立即读 deviceQuery / 显存容量 / 链路宽度，然后冷启动撤销。
+
+## 7. 控制器锁死与恢复
+
+任何命令失败后 `FUSECTRL` 停在 `0xBADFxxxx`（state=31），控制器不再应答任何 BAR0 读。处置：
+
+1. 看到 `0xBADF` 前缀立即停止一切读操作；
 2. 整机断电冷启动；
-3. 重新进窗口后先发 `CMD_SENSE`，确认 `FUSEDEBUG=0`、CRC 正常，再评估是否继续；
-4. 锁死未清除前禁止盲目重试 PROGRAM。
+3. 重新进入窗口后先发 `CMD_SENSE`，确认 `FUSEDEBUG=0`、`CRC_STATUS=0x55`，再评估是否继续；
+4. 锁死未清除前不得重试 `CMD_PROGRAM`。
 
-burntool 在每一步都检测锁死并以此消息中止（rc=3）。
+`burntool` 在每一步检测锁死并以 rc=3 中止，消息中给出上述指引。断点续烧安全：已达目标值的行会被跳过。
 
-## 5. 实卡完整验证记录（UUID 对应 fingerprint 前缀 2d827969）
+## 8. 熔丝决定的量与运行时决定的量
 
-- 17 条记录烧入行 304–320：`fbp 0x852→0x840`、`fbpa/fbio/rop_l2 0xc0330c→0xc03000`、`gpc→0x20`、`tpc4→0x40`、`tpc7→0x20`、`pes→0x38000`、`nvlink/sys_pipe→0`、PCIe Gen4 位清零（block39 的两个 `DISABLE_GEN3_SPEED` 位 + `MAGIC_BITS_D` bit25；整字 MAGIC_D 未动）。
-- 每条烧写前七项授权断言 + 现场空白检查全过；每条回读一致；全程未出现锁死。
-- 冷启动后：`BOOT0=0x170000a1`、CRC=`0x55`、DSOV=1、SBFE=1；FF 区 222–486 除新 17 行外零改动；defective 16/16 不变（同一块 die）。
-- `tpc_gpc3/6_disable` 在 **status 层**显示 `0x1`（fused 层 =0x0）：OEM 固件运行时自屏蔽，参考机上未烧卡的同字段行为相同，**属正常现象**，别再往这两个位上补烧。
-- 烧写使 SBFE=1 → fingerprint 变为 `3ab5093e8f9f78b5`（defective 基不变）。用**烧后指纹**认后续快照。
-- 重生成计划 = 0 条：潜力 80 GiB / 108 SM / NVLink / Gen4 全部就位；驱动层（geometry/Gen4）另行处理，与 FF 无关。Gen4 能起来靠的是 `MAGIC_BITS_D` bit25 被清（那是 PCIe **能力宣告**，不代表实际速率），整字 MAGIC_D 未动也不影响。
-- **指纹不是唯一身份证**：defective+SBFE 的哈希在同批次卡之间会相同（同批卡的出厂卡 SBFE 本来就是 1，其指纹与我们烧穿后重算的指纹一模一样——我们曾被这份烧前旧快照误导过一次）。fingerprint 只用来核对"烧前烧后同一块 die"，**认卡、对计划必须用 UUID**；burntool 逐行对快照是 UUID 之外的最后一道闸。
+FF 记录决定资源集合，运行时寄存器决定本启动的实际状态。两者不可互相推断：熔丝全开的卡仍可能以节流、无 ECC 的状态起来。
 
-### 5.1 采集表扩容后重采（2026-11-25，两张卡，驱动在场 + 完整 512 行）
+| 由 FF 记录决定（持久） | 由运行时寄存器决定（每次启动由主机侧解锁程序重写，断电/FLR 回到出厂值） |
+|---|---|
+| FBP/FBPA/FBIO/GPC/TPC/PES/ROP-L2 可用集合、NVLink、SYS_PIPE、媒体引擎 floorsweep、PCIe Gen3/Gen4 位、熔丝 device id | 计算块速率档、ECC 开关、显存几何映射、行重映射 |
 
-新增的 7 个只读字全部读到，两张卡读数一致：`nvdec_disable`/`status_nvdec` = `0x1f`/`0x1f`、`nvjpg_disable`/`status_nvjpg` = `0x1`/`0x1`、`ofa_disable`/`status_ofa` = `0x1`/`0x1`、`status_display`/`status_disp_head` = `0x1`/`0xf`、`FUSE_EN_SW_OVERRIDE`(`0x820040`) = 0、`DSOV`(`0x820084`) = 1（驱动在场，正常）。三对 `STATUS_OPT == OPT_DISABLE`（SYS_PIPE 已烧 0，status 层也已经是 0）⇒ **5 NVDEC + NVJPG0 + OFA0 零缺陷**，也就是说 `mig` 段显示 8/8 live 的这两张卡，现在缺的只有媒体引擎那三位。默认计划 0 记录，`gen --mig` 各 3 条：`38bbb4b3` 行 313–315 = `0x00060201`/`0x00000241`/`0x000005c1`，`85b20be7` 行 321–323 同值（`blk8` 的 `old` 不同：`0xf906 -> 0x0106`）。CMD_READ pass 在驱动在场、显存被占满的情况下跑完 512 行无 `ffrow_error`，读后 `CRC`/`DSOV` 无异常，业务无感知。指纹仍是 §5 那个烧后值 `3ab5093e8f9f78b5`（`85b20be7`），认卡仍然只认 UUID。
+实测读数（两张 80 GiB 潜力的卡，驱动在场、空闲）：
 
-## 6. 计划里带 `--mig`（媒体引擎与 MIG 门槛）时
+| 项 | 寄存器与读数 | 含义 |
+|---|---|---|
+| 计算速率是否满速 | `FEAT_READOUT_1(0x823818) = 0x00000000` | feature-override 岛的读出字：解锁态读 0（无节流位）。本仓库仅在解锁态采集过该字，未取到节流态样本 |
+| 速率覆盖来源 | `feat_ovr_sm_spd_0(0x82381c)=0x88888888`、`_1(0x823820)=0x00000008` | 易失，每启动由主机侧解锁程序写入 |
+| 融合速率档 | `ss_ffma(0x82059c)`、`ss_fmla16`/`ss_fmla32`/`ss_imla0..4` 均读 `0x5`；`ss_dp(0x820224)=0x1` | 社区地址表把 `0x5` 标为 1/32 档。实测该字为节流值而计算块并不节流，说明有效速率由上面的易失覆盖决定，FF 池不承载这些字 |
+| ECC | `OPT_ECC_EN(0x820228)=0x0`、`ECC_CTRL(0x9a0470)=0x41`、SRAM 覆盖 `0x00999999/0x003ffebf/0x0000000f` | 熔丝未开 ECC；`0x41` 置 bit0（MASTER_EN）与 bit6（SIDEBAND_EN）。`nvidia-smi -q -d ECC` 报 `ECC Mode: Enabled` 且容量仍为 81920 MiB，即侧带 ECC 不占主存。以上为本启动的运行时状态，与熔丝无关 |
+| 显存几何 | `FBPA_CFG1(0x9a0204)=0x02779000`、`MMU_LMR(0x100ce0)=0x0000028B`、`CSTATUS_RAMAMOUNT(0x9a020c)=0x1000` | 与 80 GiB 映射一致的读数（`0x28B` 为该映射的 `LOCAL_MEMORY_RANGE` 值）。驱动内 FLR（例如 `nvidia-smi -mig 1`）会把它打回出厂 8192 MiB |
+| GSP 固件启动 | `GFW_BOOT(0x118234)=0x3FF` | 全部步骤完成 |
+| PCIe 通道 | `OPT_PCIE_LANE_DISABLE(0x820394)=0`、`OPT_PCIE_LANE_DEFECTIVE(0x8205e4)=0` | 没有通道被熔丝或硅片限制；实际训练宽度由插槽与 BIOS 决定（`lspci LnkSta`） |
+| HBM 时钟 | `HBM_PLL_COEFF(0x98bc98)`：有负载时 `0x00014001`（27 MHz × 64 = 1728 MHz）、空闲时 `0x00011401`（× 20 = 540 MHz） | 该字随负载变化，是 HBM 调频，不反映熔丝状态；主机侧驱动打印的 `busy_coeff=0x14001` 与此一致 |
+| PLM | `feat_ovr_plm(0x823804)=0xffffffff`、`hbm_pll_plm(0x9a3c7c)=0xffffffdf` | 解锁程序打开的权限位 |
+| 行重映射 | `feat_ovr_row_remap(0x823824)=0`；`nvidia-smi -q -d ECC` 报 `Remapped Rows: N/A` | 该两卡不呈现行重映射计数（无重映射存储可查） |
 
-`ffcalc gen --mig` 会在默认计划之外多清 chain1 的三个 floorsweep 位段：`blk8[15:11]`（5 个 NVDEC）、`blk9[2]` 与 `blk23[3]`（NVJPG0 + OFA0，两位谁对应谁未分离，所以成对清）。烧写动作与其它记录**完全相同**，前面 §1–§4 的规则一条不漏；需要注意的是烧完之后：
+`ffcalc report` 的 `[Runtime state (BAR0, this boot)]` 段输出以上内容；快照中缺这些字时该项显示 `not read`，不会用 0 代替。
 
-1. **烧完四个 `STATUS_OPT_*` 都应读 0**：NVDEC `0x820c24`（OPT `0x820378`）、NVJPG `0x820c0c`（OPT `0x820370`）、OFA `0x820e34`（OPT `0x8202d8`）、SYS_PIPE `0x820e30`（OPT `0x8203a4`，就是 `sys_pipe_disable` 的 status 层）。任一仍非 0 就说明那位单元有物理缺陷（硬件算的是 `STATUS_OPT = OPT_DISABLE | OPT_DEFECTIVE`），这**不是**烧写失败：FF 层回读应当等于新值，缺陷位是任何熔丝都变不出去的，别再往同一位补烧。外部那张卡四条记录烧完，四个寄存器同时归 0。
-2. **`0x820c04`/`0x820c08`（DISPLAY / DISP_HEAD）保持原样**。它们对应 chain1 bit `78..82`，是那条链上除 NVDEC/NVJPG/OFA 外剩下的未归属位，而 GA100 没有显示输出——清它们没有任何收益，只有不可逆的消耗。
-3. **开关 MIG 模式之后要重启**：`nvidia-smi -mig 1` / `-mig 0` 会触发驱动内 FLR，把易失的 `FBPA_CFG1`/`LOCAL_RANGE` 几何打回出厂 8192 MiB，已建立的 slice 会悄悄缩成 `1g.1gb`。MIG 模式本身持久在 InfoROM，冷启动后由 initramfs 阶段的解锁脚本先恢复满容量几何，MIG 分片才是你要的大小（那份外部报告里写的 `65536 MiB` 是它那张卡的满容量，我们这两张是 80 GiB）。
-4. **行代价：同一轮 1 行，事后补烧 3 行**。FF 记录写的是**整个 16-bit 块**：`nvdec_disable` 在 blk8、`bit371` 在 blk23，只要这一轮本来就为 gpc/fbpa 与 nvlink/sys_pipe 重写这两个块，引擎位就是顺带写进去的、不吃行，真正新增的只有承载 `blk9[2]` 那一条。**但算力已经烧完的卡享受不到这点**——我们两张已完全解锁的卡重采后 `gen --mig` 各出 3 条（`blk8`/`blk9`/`blk23` 一人一行，例如 `0x00060201`、`0x00000241`、`0x000005c1`，接在最后已烧行之后）。外部那张卡分轮清这几个位花了 4 行（`blk23` 被写两次）。`gen --mig` 打印的是这张卡这一轮的真实数字（`row cost of --mig on this card: N extra FF row(s) ...`），别按「反正只有一行」估。
-5. **采集表扩容前抓的老快照缺字**：`--mig` 只在快照读到过 `nvjpg_disable`/`status_nvjpg`/`ofa_disable`/`status_ofa` 时才会为那一对位出行（这三个引擎没有 `*_DEFECTIVE` 寄存器，`STATUS_OPT == OPT_DISABLE` 是唯一能证明单元存在的路）。缺字时计划警告 `re-capture` 并跳过，**此时 `--set` 也不能绕过**——手填的值同样不能告诉你这块 die 上有什么。我们的两张卡已按新表重采，四对 `STATUS_OPT`/`OPT_*` 全部相等（`0x1f`/`0x1f`、`0x1`/`0x1`、`0x1`/`0x1`，SYS_PIPE 已烧 0 故读 0），也就是**三个引擎都物理存在且零缺陷，烧下去能全部放出来**。
+## 9. 计划包含媒体引擎位（`--mig`）
 
-## 7. 计划里有 `pcie_devida` / `pcie_devidb` 时（A100 身份转换）
+`gen --mig` 追加 chain1 的三个 floorsweep 位段：`blk8[15:11]`（5 × NVDEC）、`blk9[2]`、`blk23[3]`（NVJPG0 + OFA0）。烧写动作与其他记录完全相同，§1–§7 规则一条不漏。
 
-`ffcalc gen --a100` 会多出身份相关的记录：chain2 blk37（DEVIDA）、blk38（DEVIDB）写 `0x416a` = `0x20B5<<1`，即 `0x416A0942` / `0x416A0982`；外加把整字 MAGIC_BITS_D 写成 `0x00200000`（按卡现值涉及 blk45/46/47 中真正变化的那几块）。**状态：身份那两条出自社区/他人的实测报告，本仓库还没在自己的卡上走过；MAGIC_BITS_D 的整字改写更不是报告步骤，是我们「都要当 A100 就把能力宣告满」的判断，`0x00200000` 没人从真 A100 上读过**——我们能验证的是编码与记录格式自洽（自家 FF 快照里 blk37/38 回放出的就是 `0x4184`，`gen --a100` 生成的就是上面那两条），平台侧结果（POST、BAR1 128G、驱动识别）一律按未验证对待。不认可整字改写就 `--a100 --skip magic_d`，退化成「只烧报告烧过的那两条」。
+- **位段归属**：`bit146` 与 `bit371` 与 `{OPT_NVJPG_DISABLE(0x820370), OPT_OFA_DISABLE(0x8202d8)}` 的对应关系尚未分离，因此成对清除。
+- **零缺陷自证**：这三个引擎没有 `*_DEFECTIVE` 寄存器，硬件计算 `STATUS_OPT_* = OPT_DISABLE | OPT_DEFECTIVE`，故 `STATUS_OPT == OPT_DISABLE` 即零缺陷证据。实测：`nvdec_disable/status_nvdec = 0x1f/0x1f`、`nvjpg_disable/status_nvjpg = 0x1/0x1`、`ofa_disable/status_ofa = 0x1/0x1`，SYS_PIPE `0x8203a4/0x820e30` 均为 0 且 `sys_pipe_defective = 0`。计划只有在快照读到这四对字时才会为相应位出行，缺字即跳过并警告；`--set` 不能绕过。
+- **行代价**：本轮本来就要重写 `blk8`/`blk23` 时（新卡走默认计划）新增 1 行（承载 `blk9[2]`）；能力记录已烧完的卡三个位段各占一行，共 3 行。`gen --mig` 打印该卡本轮的真实数字。
+- **烧后校验**：四个 `STATUS_OPT_*` 应读 0。任一仍非 0 表示该单元物理缺陷，不是烧写失败（FF 层回读等于新值即可），不得补烧。
+- `0x820c04` / `0x820c08`（DISPLAY / DISP_HEAD，chain1 bit 78..82）保持原样：GA100 无显示输出，清除它们没有收益。
+- **MIG 模式**：`nvidia-smi -mig 1/-mig 0` 触发驱动内 FLR，会把易失的 `FBPA_CFG1` / `LOCAL_MEMORY_RANGE` 打回出厂 8192 MiB，已在世的 slice 缩为 `1g.1gb`，因此切换 MIG 模式后必须重启，让主机侧解锁程序先恢复满容量几何。清 `sys_pipe_disable` 之后 `mig -lgip` 才出全套 profile 是外部报告的功能侧结论，本仓库未做 MIG 功能验证；本仓库确认的是该位段位置与 `SYS_PIPE` 的 `STATUS == OPT == 0`、`sys_pipe_defective = 0`。
 
-烧写动作与其它记录**完全相同**——同一套 SENSE→arm→PROGRAM→回读断言，同样多的空白行，本文前面的规则一条不漏。不同的是烧完之后的世界：
+## 10. 计划包含身份改写（`--a100`）
 
-1. **身份那两条改变的是「这张卡是谁」**：冷启动后芯片自己就是 `10de:20b5`，lspci、驱动、GSP/DevInit 的启动门槛全部按 A100 认它。其它记录（含 MAGIC_BITS_D 那几条）只改容量/SM/链路/能力宣告，从不碰身份。
-2. **烧完不等于结束**：SPI 里还是 CMP ROM 时，VBIOS devid 与熔丝 devid 不匹配，卡起不来。门槛比的是**熔丝 devid**，所以必须 `nvflash` 刷一份 A100 80GB PCIe vBIOS（ROM 不用改一个字节）。`nvflash --save` 先备份这张卡自己的 CMP ROM。
-3. **带内无退路**：平台 POST 不过 → 驱动不在 → nvflash 进不去 → 只能 CH341A + SOP8 夹离线刷 SPI。这就是「没备好 CH341A 和烙铁不要烧这几条」的原因。熔丝本身可以再补一条记录把 id 指回别的值（链内后写覆盖先写），但前提仍是卡能冷启动回到烧写窗口。
-4. **平台门槛**：A100 VBIOS 声明 BAR1=128GB，BIOS 必须给得出 128 GB 的 64-bit prefetchable BAR1（`Above 4G Decoding` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G`），否则卡死在 VGA 灯上。判据是 MMIO 窗口，不是主板新旧。
-5. **`old` 列是 FF 层对该块的回放值**：实卡出厂就在 FF 链里写了 `0x4184`（= `0x20C2<<1`），所以正常看到 `0x4184 -> 0x416a`。如果这次读出的行没覆盖到承载 id 的那条记录，`old` 会显示 `0x0000`，计划会额外警告「回放值与熔丝寄存器读数不一致」——记录写的是整块新值（链内后写覆盖先写），不受影响，但要用 `ffcalc report` 的 `[Fused device id]`（读熔丝寄存器 `0x8204d8`/`0x82056c`）确认现在到底是哪个 id。
-6. burntool 在 `YES` 之前会打印计划警告与一条 `NOTICE`，并跑完离线核验才发问——**别不看就敲 YES**。
-7. 转换之后 `scripts/ffscan.sh` 仍能找到这张卡（`0x20c2` 与 `0x20b5` 都认），闭环检查照做。
-8. **和 `--mig` 同一轮一起烧**（`gen --a100 --mig`，或 `ffscan.sh --a100 --mig`）：两者动的是不同的链——引擎位在 chain1 `blk8/blk9/blk23`，身份与能力在 chain2 `blk37/blk38/blk46/blk47`——互不重叠。计划里那三条引擎记录与只加 `--mig` 时逐字节相同（测试钉住），`--a100` 也不会让引擎位的行代价变大：那条警告的基线本来就包含身份那几条。计划按链排序，**chain1 的引擎位排在 chain2 的身份位之前**，而 burntool 就按计划顺序执行，所以万一中途断链，留下的是「仍是 CMP 170HX、但媒体引擎已放开」的可启动状态，而不是「熔丝已是 A100、ROM 还没刷」那种只能 CH341A 救的半成品；反过来自觉先烧身份再回头补引擎才是危险顺序。另外：换身份**不会白送媒体引擎**，NVDEC/NVJPG/OFA 照样由同一套 floorsweep 位管着，该清的一位不少。
+`gen --a100` 追加 chain2 blk37（DEVIDA）、blk38（DEVIDB）= `0x416a`（`0x20B5 << 1`）即记录 `0x416A0942` / `0x416A0982`，并把 `MAGIC_BITS_D` 整字写成 `0x00200000`（按卡现值涉及 blk45/46/47 中真正变化的块）。
 
-## 8. 踩坑速查（本流程实际踩过或已替你挡住）
+- `MAGIC_BITS_D` 是能力宣告字而非速率寄存器，且不是启动门槛；清 bit25 即宣告 Gen4（默认计划已清，本仓库卡整字未动时 Gen4 训练通过）。整字改写是本仓库的判断，`0x00200000` 无实测来源，可用 `--a100 --skip magic_d` 退出，或 `--set magic_d=HEX` 钉入自己读到的真值。
+- 启动门槛比较的是**熔丝 device id**与 VBIOS device id，因此改完熔丝必须刷对应 A100 80GB PCIe vBIOS，ROM 无需修改。先刷 ROM 而熔丝仍为 `0x20C2` 会被拒。
+- **DEVIDA 与 DEVIDB 必须同一轮烧完。** 打开一次烧写窗口的成本（台架时序、上电时机）远高于多写一条记录，把两半分到两轮会把同一个成本付两次；而只烧一半会留下两份 id 不一致、门槛读哪一份无文档可依的状态，那种状态下卡起不来。这是本仓库刻意把 `--a100` 默认设成同轮写两条的原因，`--skip` 中其一会触发计划警告。
+- 平台必须给出 128 GB 的 64-bit prefetchable BAR1：`Above 4G Decoding` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G`。判据是 MMIO 窗口大小。
+- 平台 POST 失败时带内无退路（驱动不在、nvflash 不可用），只能 CH341A + SOP8 夹离线刷 SPI。
+- `old` 列是 FF 层对该块的回放值：出厂在 FF 链中写了 `0x4184`（`0x20C2<<1`），正常显示 `0x4184 -> 0x416a`；若本次读出的行未覆盖承载 id 的记录，`old` 显示 `0x0000` 且计划额外警告——记录写的是整块新值，不受影响，但必须用 `ffcalc report` 的 `[Fused device id]`（读 `0x8204d8` / `0x82056c`）确认当前身份。
+- 与 `--mig` 同轮执行时，计划按链排序，chain1 的引擎位排在 chain2 的身份位之前，`burntool` 按计划顺序执行，因此中途断链留下的状态是"仍是 CMP 170HX、媒体引擎已放开"，而不是"熔丝已是 A100、ROM 未刷"。身份转换不会释放媒体引擎，那三位仍需清除。
+
+## 11. 采集探针的操作规则
+
+`scripts/ffscan.sh` 从 `ffcalc/data/ga100-fuses.json` 生成 `ffprobe.ko`：`ioremap(bar0, PROBE_MAPLEN)` → `readl` 全表（105 词）→ 可选 `CMD_READ` 512 行 → `pr_info` → 自卸载（`return -EAGAIN`）。规则：
+
+- **只在卡空闲时加载。** `ffscan.sh` 检测到计算进程时拒绝 `insmod`（rc=3）；`FFROWS=1` 时主机侧解锁程序的 keeper 进程也视为占用。`FORCE=1` 是显式承担后果的覆盖开关，不是常规参数。
+- **映射长度由寄存器表自动推导**（当前 `0x9a5000`，覆盖到 `0x9a3c7c` 的 FB/HBM 侧寄存器）。表项超出 `ioremap` 范围时 `readl` 不产生干净错误：本仓库在该状态下遇到过 `insmod` 被内核终止、整机需要重启。两层防护：生成器在表项超出 BAR0 时拒绝生成；模块内做运行时边界检查，越界表项打印 `SKIPPED` 而不读取。
+- words 通道对设备零写入；`capture.py` 默认以 `O_RDONLY` + `ACCESS_READ` 映射 BAR0，只有 `--read-ff-rows`（CMD_READ）与 `burntool burn`/`swiff` 请求可写映射。
+- 免驱态刚烧完不要依赖 `CMD_SENSE` 刷新 FF 层：或冷启动，或 `revert` 后 `echo bus > .../reset_method; echo 1 > reset` 触发 bus reset 并重新映射 BAR0，再读新行。读回 `0x00000000` 不等于烧坏。
+
+## 12. 已确认基线（本仓库两张卡）
+
+- 一次完整烧写闭环：17 条记录，行 304–320，`fbp 0x852→0x840`、`fbpa/fbio/rop_l2 0xc0330c→0xc03000`、`gpc→0x20`、`tpc4→0x40`、`tpc7→0x20`、`pes→0x38000`、`nvlink/sys_pipe→0`、Gen4 位清零（block39 的两个 `DISABLE_GEN3_SPEED` 位 + `MAGIC_BITS_D` bit25）。冷启动后 `PMC_BOOT_0 = 0x170000a1`、`CRC_STATUS = 0x55`、FF 区除新 17 行外零改动、defective 全部不变。
+- 两卡当前状态：512 行快照齐全，`plans/*.burn.json` 为 0 记录（潜力已全部落地）；`GPU-38bbb4b3…` 124 SM / `fc497d01b8255867`，`GPU-85b20be7…` 108 SM / `3ab5093e8f9f78b5`（该卡 `gpc_disable = gpc_defective = 0x20`，即一个 GPC 由硅片缺陷限制）。
+- `tpc_gpc3/6_disable` 的 **status 层读 0x1、fused 层读 0x0**，两张卡一致。两层不一致说明该位当前不是由熔丝决定；fused 层已为 0，向这两个位补烧记录不会改变 status 读数。
+- fingerprint 由全部 `*_DEFECTIVE` 字与 SBFE 位哈希而来，物理缺陷不随烧写与重启变化；同批次卡的烧前指纹可能与另一张卡的烧后指纹相同，因此**认卡与对计划以 UUID 为准**，fingerprint 仅用于确认同一块 die 的前后一致。
+
+## 13. 速查
 
 | 症状 | 原因 | 处置 |
 |---|---|---|
-| 写了记录但行还是 0 | 写进了 `FUSEDATA`（只读口） | 写 `FUSEWDATA(0x82000C)` |
-| `PLM_FUSE` 写不进 | 该位由 `WDATA_WR_SECURE` 门控 | 写 WSEC=0，PLM 自动放开 |
-| 冷启动后 SBFE 还是 1 | 以为"没授权所以不能写" | DSOV=0 时 `0x821108` 可写，写 0 即授权；冷启动后恢复 1 属正常 |
-| 读到 `0xBADFxxxx` | 命令失败，控制器锁死 | 停止读→冷启动→SENSE 评估（§4） |
-| `tpc3/6` status≠fused | 固件运行时自屏蔽 | 正常，fused 层对即可 |
-| 拿错卡烧错行 | 槽位变了 UUID/指纹没对 | 第 1、4 步的 UUID/fingerprint/逐行对快照三道闸全部必过 |
-| 计划里行号变了 | 上一次烧写后旧计划作废 | 每轮烧完重新 `scan`，以新计划为准 |
-| 烧完 devid 后卡不 POST / 不初始化 | 熔丝已是 A100 `0x20B5`，SPI 里还是 CMP ROM（ID 不匹配，门槛比的是熔丝） | 刷 A100 80GB PCIe vBIOS；已经挂死则 CH341A 离线刷 SPI |
-| 刷了 A100 ROM 仍卡 VGA 灯 | 平台没给出 128G 64-bit prefetchable BAR1 | `Above 4G` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G` |
-| 转 A100 后 `ffscan.sh` 扫不到卡 | 脚本原先只认 device `0x20c2` | 现在 `0x20c2`/`0x20b5` 都认；`capture.py`/`burntool` 同样两种都收 |
-| 只烧了 `pcie_devida` 或只烧了 `pcie_devidb` | 两份 id 不一致，门槛读哪份无文档 | 计划已警告；同一轮把两半补齐 |
-| 按 `--a100` 烧了 MAGIC_BITS_D，之后想收回 | 整字值 `0x00200000` 是社区猜测，报告里根本没动这个字 | 补一条记录把该块写成别的值（链内后写覆盖先写，前提仍是能进烧写窗口）；不确定就别烧：`--a100 --skip magic_d` |
-| `--mig` 计划里没有 NVJPG/OFA 那两位 | 快照是采集表扩容前抓的，`nvjpg_disable`/`ofa_disable` 这两个字没读到，工具不肯为「大概没事」花行 | 重跑 `ffscan.sh`（新探针多读 7 个字，61 → 68）再出计划；`--set` 故意不能绕过这道门 |
-| 烧完 MIG 后 slice 缩成 `1g.1gb`、显存显示 8192 MiB | `-mig 1`/`-mig 0` 触发驱动内 FLR，易失的 `FBPA_CFG1`/`LOCAL_MEMORY_RANGE` 被打回出厂几何 | 立刻重启，让 initramfs 阶段的解锁脚本先恢复满容量几何（§6） |
-| 免驱态刚烧完读新 FF 行读出 `0x00000000` | `CMD_SENSE` 只重新感测 control rows 0–1，不刷新 FF 池 | 冷启动，或 `revert` 后 `echo bus > reset_method; echo 1 > reset` 再重映射 BAR0；别当作烧坏再补一条 |
-| 烧完四个 `STATUS_OPT_*` 里还有位是 1 | 那位单元物理缺陷（硬件算 `STATUS_OPT = OPT_DISABLE \| OPT_DEFECTIVE`） | 不是烧写失败（FF 层回读已等于新值就行），**别补烧**；该引擎按少一个单元计 |
-| blk23 被烧了两次、白吃一行 | SYS_PIPE 与 bit371 分了两个窗口清 | 同一轮出计划：`nvlink`/bit371/`sys_pipe` 合成一条 `0x000005c1`（§6） |
+| 写了记录但行仍为 0 | 写进了只读口 `FUSEDATA` | 写 `FUSEWDATA (0x82000c)` |
+| `PLM_FUSE` 写不进 | 由 `WDATA_WR_SECURE` 门控 | 写 `WDATA_WR_SECURE=0`，PLM 自动放开 |
+| 冷启动后 `SBFE_SHADOW` 仍为 1 | 冷启动恢复默认值 | `DSOV=0` 时写 0 即授权，属正常 |
+| `DSOV=0` 但写入不生效 | `PRIV_MASK` / `PLM_FUSE_WDATA` 未放开（近失状态） | 不是可用窗口，重新冷启动 |
+| `FUSECTRL` 读 `0xBADFxxxx` | 命令失败，控制器锁死 | 停止读 → 断电冷启动 → `CMD_SENSE` 评估（§7） |
+| `FUSEDEBUG` 非 0 | 外部报告称 bit1（RWL）选择 RIR 宏，FF 记录会落到行 0–7（该后果未复现） | §4 判据要求 `FUSEDEBUG=0`，不满足即不得烧写 |
+| `--mig` 计划里没有 NVJPG/OFA 位 | 快照缺 `OPT_*`/`STATUS_OPT_*` 对 | 用当前采集表重跑 `ffscan.sh`；`--set` 不能绕过 |
+| 烧完某个 `STATUS_OPT_*` 仍非 0 | 该单元物理缺陷 | 非烧写失败，不得补烧 |
+| 开/关 MIG 后显存显示 8192 MiB、slice 缩成 `1g.1gb` | 驱动内 FLR 恢复出厂几何 | 重启，让解锁程序先恢复几何 |
+| 烧完 devid 后卡不 POST | 熔丝为 A100、SPI 内为 CMP ROM | 刷 A100 80GB PCIe vBIOS；已挂死则 CH341A 离线刷 SPI |
+| 刷了 A100 ROM 仍卡 VGA | 平台未给出 128G prefetchable BAR1 | `Above 4G` / `CSM=off` / `Re-Size BAR` / `MMIO High Size ≥ 128G` |
+| 计划行号与上一轮不同 | 每轮的可用空白行位置随已烧行前移 | 每轮烧完重新 `scan`，以新计划为准 |
+| `insmod` 长时间无输出后被终止 | 控制器忙或映射越界 | 检查卡是否空闲；确认 `ffprobe.c` 由当前表重新生成（`PROBE_MAPLEN` 覆盖全表） |

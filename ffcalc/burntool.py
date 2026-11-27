@@ -185,6 +185,66 @@ def cmd_burn(rd, wr, plan_path, dump_path, rows=None, log=print,
     return 0
 
 
+def cmd_swiff(rd, wr, plan_path, dump_path=None, rows=None, log=print,
+              sleep=None, clock=None, confirm=None):
+    """Rehearse a plan without destroying anything: apply its records as IFF
+    fuses for this boot (see ffmacro.swiff_apply).
+
+    Same records and the same window requirement as `burn`, but nothing is
+    programmed: a cold boot puts the card back exactly as it was, which is the
+    point of the rehearsal -- a mistaken plan costs a power cycle instead of a
+    row. The IFF window holds one row per record (488-507 on a factory card,
+    read from IFF_RECORD), so a plan longer than that cannot be rehearsed whole.
+
+    Whether the card then *behaves* as if the records were burnt is what this
+    command exists to find out: it has not been measured on the cards here, so
+    the reading is the experiment -- run it, check deviceQuery / memory size /
+    link width, then cold boot to undo.
+    """
+    try:
+        plan = load_plan(plan_path)
+    except BadSnapshot as exc:
+        log("REFUSED: plan unreadable: %s" % exc)
+        return 1
+    recs = list(plan.get("burn") or ())
+    if rows:
+        wanted = {int(r, 0) for r in rows.split(",")}
+        recs = [r for r in recs if r["row"] in wanted]
+    if not recs:
+        log("REFUSED: plan has no records to apply")
+        return 1
+    window_rows = None
+    if dump_path:
+        try:
+            window_rows = load_dump(dump_path)["ff_rows"]
+        except BadSnapshot as exc:
+            log("REFUSED: dump unreadable: %s" % exc)
+            return 1
+    else:
+        log("note: no --dump, so IFF window occupancy is not checked")
+    if confirm is not None and not confirm():
+        log("aborted")
+        return 2
+    kw = {}
+    if sleep is not None:
+        kw["sleep"] = sleep
+    if clock is not None:
+        kw["clock"] = clock
+    try:
+        applied = ffmacro.swiff_apply(
+            rd, wr, [int(r["record"], 0) for r in recs],
+            rows=window_rows, **kw)
+    except ffmacro.FuseControllerError as exc:
+        log("ABORT: %s" % exc)
+        return 3
+    for row, record in applied:
+        log("iff row %3d <= 0x%08x (volatile)" % (row, record))
+    log("done: %d record(s) live for this boot only. Check the card now "
+        "(deviceQuery / memory size / link width); a cold boot removes all of "
+        "it -- nothing here was burnt" % len(applied))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m ffcalc.burntool")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -198,20 +258,35 @@ def main(argv=None):
     bp.add_argument("--force", action="store_true",
                     help="skip live-snapshot re-match (NOT recommended)")
     bp.add_argument("--yes", action="store_true")
+    sw = sub.add_parser("swiff", help="apply a plan as volatile IFF fuses")
+    sw.add_argument("plan")
+    sw.add_argument("--dump", help="card snapshot, to skip occupied window rows")
+    sw.add_argument("--bdf")
+    sw.add_argument("--rows", help="subset of the plan's rows")
+    sw.add_argument("--yes", action="store_true")
     args = ap.parse_args(argv)
 
-    bdf, mm = open_bar0(args.bdf)
+    # `status` only ever reads, so it maps the BAR read-only: the burn and the
+    # SW-IFF verbs are the only paths that ask the kernel for a writable
+    # mapping, which is what makes "these two verbs can change the card" true
+    # at the OS level and not only in the code.
+    bdf, mm = open_bar0(args.bdf, writable=args.cmd in ("burn", "swiff"))
     r = functools.partial(_rd, mm)
     w = functools.partial(_wr, mm)
     print("card at %s" % bdf)
     if args.cmd == "status":
         return cmd_status(r)
 
+    verb = "burn" if args.cmd == "burn" else "apply (IFF, volatile)"
+
     def confirm():
-        ans = input("burn %s onto %s? type YES to continue: "
-                    % (args.plan, bdf))
+        ans = input("%s %s onto %s? type YES to continue: "
+                    % (verb, args.plan, bdf))
         return ans.strip() == "YES"
 
+    if args.cmd == "swiff":
+        return cmd_swiff(r, w, args.plan, dump_path=args.dump, rows=args.rows,
+                         confirm=None if args.yes else confirm)
     return cmd_burn(r, w, args.plan, args.dump, rows=args.rows,
                     force=args.force, confirm=None if args.yes else confirm)
 

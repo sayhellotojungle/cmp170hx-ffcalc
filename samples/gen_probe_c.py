@@ -23,6 +23,9 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 
 from ffcalc import ffmacro  # noqa: E402
 
+FUSE_REGION_END = 0x00830000   # the fuse macro block CMD_READ touches
+BAR0_SIZE = 0x01000000         # GA100 BAR0, as ffcalc.capture maps it
+
 TPL = """\
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -33,6 +36,10 @@ TPL = """\
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("ffcalc GA100 fuse probe (words read-only + CMD_READ rows)");
+
+/* Generated: covers every offset in the table below, page aligned. The probe
+ * reads only inside this window (see the bounds check in ffprobe_init). */
+#define PROBE_MAPLEN @MAPLEN@
 
 static u64 bar0;
 module_param(bar0, ullong, 0444);
@@ -54,13 +61,24 @@ static int __init ffprobe_init(void)
 
 	if (!bar0)
 		return -EINVAL;
-	h = ioremap(bar0, 0x00830000);
+	h = ioremap(bar0, PROBE_MAPLEN);
 	if (!h)
 		return -ENOMEM;
-	for (i = 0; i < ARRAY_SIZE(entries); i++)
+	for (i = 0; i < ARRAY_SIZE(entries); i++) {
+		/* Never readl() outside the mapping: on a card that is serving
+		 * traffic that is an OOPS, not a clean failure. A table entry past
+		 * PROBE_MAPLEN is a generator bug; skipping it costs one word,
+		 * honouring it can cost the host.
+		 */
+		if (entries[i].off + 4 > PROBE_MAPLEN) {
+			pr_info("FFPROBE %s %08llx SKIPPED %08x\\n", entries[i].name,
+				(u64)bar0 + entries[i].off, PROBE_MAPLEN);
+			continue;
+		}
 		pr_info("FFPROBE %s %08llx %08x\\n", entries[i].name,
 			(u64)bar0 + entries[i].off,
 			readl(h + entries[i].off));
+	}
 	if (ffrows)
 		pr_info("FFPROBE ffrows_done 00000000 %08x\\n",
 			ffprobe_read_rows(h) ? 1 : 0);
@@ -93,7 +111,19 @@ def main():
     entries += regs
     body = ['\t{ 0x%08x, "%s" },' % (off, name)
             for off, name in sorted(entries)]
+    # The window has to cover every word the module touches: the framebuffer,
+    # MMU and HBM PLL words sit at 0x9a_xxxx / 0x98_xxxx, well past the fuse
+    # block, and a readl past the end of the mapping is a kernel OOPS on a card
+    # that is serving traffic -- not a clean failure. It used to be hardcoded to
+    # 0x00830000, which was exactly wide enough for the fuse block and nothing
+    # else. The floor keeps the CMD_READ path's macro registers inside.
+    last = max([off for off, _ in entries] + [FUSE_REGION_END])
+    maplen = min(BAR0_SIZE, (last + 0x1000 + 0xFFF) & ~0xFFF)
+    if last >= BAR0_SIZE:
+        raise SystemExit("register table offset 0x%x is outside BAR0 (0x%x)"
+                         % (last, BAR0_SIZE))
     src = TPL.replace("@BODY@", "\n".join(body))
+    src = src.replace("@MAPLEN@", "0x%08x" % maplen)
     src = src.replace("@FFROWS@", ffmacro.probe_c_source())
     print(src)
 

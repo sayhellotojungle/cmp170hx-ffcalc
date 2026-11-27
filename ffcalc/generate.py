@@ -58,7 +58,7 @@ A100_MAGIC_WARNING = (
 # come: what the bits are, what comes out of burning them, and what this does
 # not prove. The row cost is not asserted here -- it depends on which blocks
 # this card's plan already rewrites, so it is computed per plan and appended
-# below. The long version is in README ("媒体引擎与 MIG 解锁（--mig）").
+# below. The long version is the "媒体引擎与 MIG（--mig）" section of README.
 MIG_WARNINGS = (
     "nvdec_disable/nvjpg_ofa_disable_bit146/bit371: these are Chain-1 (TOP_FS) "
     "floorsweep bits, not a driver check for 10de:20c2 and not a VBIOS lock. "
@@ -66,20 +66,21 @@ MIG_WARNINGS = (
     "STATUS_OPT_* == OPT_DISABLE for them, and hardware computes STATUS_OPT = "
     "OPT_DISABLE | OPT_DEFECTIVE, so that equality means every unit exists with "
     "no defects (on the community card the same clear made every NVDEC/NVJPG/"
-    "OFA slot show up in NV_PTOP_DEVICE_INFO2). The cheap software route is dead "
-    "on datacenter GA100: FUSE_EN_SW_OVERRIDE (0x820040) = 0, and the community "
-    "checks found that volatile writes to the override/option words "
+    "OFA slot show up in NV_PTOP_DEVICE_INFO2). The volatile route for these "
+    "floorsweep bits is inert on datacenter GA100: FUSE_EN_SW_OVERRIDE (0x820040) "
+    "= 0, and writes to the override/option words "
     "(CTRL_OPT_NVJPG 0x82080c, CTRL_OPT_NVDEC 0x820824, CTRL_OPT_SYS_PIPE "
     "0x820a30, OPT_NVDEC_DISABLE 0x820378, OPT_SYS_PIPE_DISABLE 0x8203a4) never "
-    "moved STATUS_OPT_*, even inside Goldilocks. Burning an FF record is the "
-    "only lever",
+    "moved STATUS_OPT_*, even inside the burn window. (That is this route only: "
+    "the 0x8238xx feature-override island -- compute rate, ECC, FB geometry -- is "
+    "a separate mechanism and is written every boot.) Burning an FF record is "
+    "the only lever for these bits",
     "what this buys: 5x NVDEC hardware decode (H264/HEVC/VP9/MPEG2/JPEG; no "
     "AV1, GA100's NVDEC predates the GA10x AV1 block), NVJPG0 hardware JPEG "
     "decode, OFA0 optical flow (NvOF API 5.0), and real multi-instance MIG -- "
     "with sys_pipe_disable=0, which the default plan already burns, the 8 "
     "SYS_PIPEs give 8g/4g/2g/1g profiles instead of the single non-"
-    "partitionable 1g that un-burnt cards show. A retail A100 stops at 7g "
-    "because one of its GPCs is floorswept",
+    "partitionable 1g that un-burnt cards show",
     "what this does NOT prove: which of bit146/bit371 is NVJPG and which is "
     "OFA (both are cleared, as with the two unresolved DISABLE_GEN3_SPEED "
     "bits; separating them takes a bus reset between the two rows on a second "
@@ -213,10 +214,13 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False):
                     "block either way" % (key, replayed, live))
         if len(ids_in_plan) == 1:
             warnings.append(
-                "only %s is rewritten here: the two halves of the id are "
-                "meant to agree, and which one the boot gate reads is not "
-                "documented, so burn both in the same window unless you know "
-                "why you are not" % ids_in_plan[0])
+                "only %s is rewritten here: the two halves of the id are meant "
+                "to agree, and which one the boot gate reads is not documented. "
+                "Opening a burn window is the expensive part of this procedure "
+                "(power sequence and timing, not the record count), so splitting "
+                "the two halves pays that cost twice and leaves the card in an "
+                "id-inconsistent state in between: burn both in the same window "
+                "unless you know why you are not" % ids_in_plan[0])
     if "magic_d" in in_plan:
         # Whoever burns this word, from --a100 or an explicit --set, has to
         # know the value is a guess and what the cheaper alternative was.
