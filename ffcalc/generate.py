@@ -53,12 +53,13 @@ A100_MAGIC_WARNING = (
 )
 
 
-# --mig clears the Chain-1 floorsweep bits on the media engines. Everything the
-# operator needs in order to agree to those rows, in the order the questions
-# come: what the bits are, what comes out of burning them, and what this does
-# not prove. The row cost is not asserted here -- it depends on which blocks
-# this card's plan already rewrites, so it is computed per plan and appended
-# below. The long version is the "媒体引擎与 MIG（--mig）" section of README.
+# The Chain-1 floorsweep bits on the media engines are part of the default plan;
+# `--no-mig` leaves them fused. Everything the operator needs in order to agree to
+# those rows, in the order the questions come: what the bits are, what comes out of
+# burning them, and what this does not prove. The row cost is not asserted here --
+# it depends on which blocks this card's plan already rewrites, so it is computed
+# per plan and appended below. The long version is the "媒体引擎与 MIG" section of
+# README.
 MIG_WARNINGS = (
     "nvdec_disable/nvjpg_ofa_disable_bit146/bit371: these are Chain-1 (TOP_FS) "
     "floorsweep bits, not a driver check for 10de:20c2 and not a VBIOS lock. "
@@ -95,7 +96,7 @@ MIG_WARNINGS = (
 )
 
 
-def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
+def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=True,
          allow_hard_floor=False):
     # Without a complete FF-row snapshot we cannot know which rows are
     # occupied or what the current block values are; refuse rather than
@@ -103,9 +104,10 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
     ffrows.require(dump, "generate a burn plan")
     only = set(only) if only else None
     skip = set(skip)
-    # --a100/--mig add targets below; copy first so a caller's dict (and a
-    # re-used overrides dict) is never rewritten by planning a card.
+    # --a100 adds targets below; copy first so a caller's dict (and a re-used
+    # overrides dict) is never rewritten by planning a card.
     overrides = dict(overrides or {})
+    mig_keys = ()
     if a100:
         # Community-reported path: the boot gate that refuses an A100 vBIOS
         # compares the *fused* device id with the rom's, so the conversion
@@ -128,14 +130,16 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
                                  else A100_DEVID)
     if mig:
         # The media-engine floorsweep bits (chain1 blk8[15:11], blk9[2],
-        # blk23[3]). Nothing else in this tool touches them, and without a
-        # STATUS_OPT_* readout resolve_targets() refuses them outright: see
-        # MIG_WARNINGS and the field comments in optionmap.py.
-        for key in ENGINE_KEYS:
-            if key in skip or (only is not None and key not in only):
-                continue
-            overrides.setdefault(key, 0)
-    rep = analyze(dump, overrides)
+        # blk23[3]) are in the plan unless this is `--no-mig`. Nothing else in
+        # this tool touches them, and without a STATUS_OPT_* readout
+        # resolve_targets() refuses them outright: see MIG_WARNINGS and the
+        # field comments in optionmap.py. Honored here rather than as an
+        # override, so --skip/--only still decide: a target with no record
+        # behind it would leave `sim` reporting an unfilled field this plan was
+        # told to leave alone.
+        mig_keys = tuple(key for key in ENGINE_KEYS
+                         if key not in skip and (only is None or key in only))
+    rep = analyze(dump, overrides, mig_keys=mig_keys)
     targets = rep["targets"]
     warnings = list(rep["warnings"])
     words = dump["option_words"]
@@ -181,7 +185,7 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
     base = {c: dict(b) for c, b in replay_blocks(dump).items()}
     pending = {c: dict(b) for c, b in base.items()}
     # The same replay with the media-engine bits left alone: what this plan
-    # would have written anyway. `--mig` costs a row only where it changes a
+    # would have written anyway. Those bits cost a row only where they change a
     # block this baseline does not already touch, which is the difference
     # between "clearing NVDEC is free" (chain1 blk8 is being rewritten for
     # gpc/fbpa regardless) and "clearing NVDEC costs a row".
@@ -282,7 +286,8 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
                             if f.key in ENGINE_KEYS and f.key in in_plan)
         free = sorted(engine_blocks & touched(baseline))
         if extra_rows:
-            msg = ("row cost of --mig on this card: %d extra FF row(s) (%s)"
+            msg = ("row cost of the media-engine bits on this card (--no-mig "
+                   "leaves them fused): %d extra FF row(s) (%s)"
                    % (len(extra_rows),
                       ", ".join("chain%d blk%d" % t for t in extra_rows)))
             if free:
@@ -300,8 +305,9 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
                     "records is the cheap moment")
         else:
             warnings.append(
-                "row cost of --mig on this card: 0 extra rows, every engine bit "
-                "here sits in a block the plan already rewrites")
+                "row cost of the media-engine bits on this card: 0 extra rows, "
+                "every engine bit here sits in a block the plan already rewrites "
+                "(the cheap moment; --no-mig would skip them entirely)")
         pair = [key for key in ENGINE_PAIR_KEYS if key in in_plan]
         if len(pair) == 1:
             warnings.append(

@@ -103,16 +103,43 @@ class TestDump(unittest.TestCase):
         self.assertFalse(any("fbp_disable" in r["fields"]
                              for r in obj2["burn"]))
 
-    def test_default_plan_burns_the_same_records_it_always_did(self):
-        """Nothing outside --a100/--mig may move for a user who never asks for
-        it: the records below are the ones this tool has always emitted for the
-        sample card. What changed is the sample's FF *data*: it now also carries
-        the factory media-engine bits, including one more burnt record (chain1
-        blk9 = `0x00040241`, the stock bit146), which moves the last used row
-        from 239 to 240 and so shifts every planned row by one; blk23's
-        `old`/`new` keeps bit371 fused. The burn set itself is the same 12
-        records, and no engine field appears anywhere in it."""
+    def test_default_plan_burns_the_media_bits_too(self):
+        """The media-engine floorsweep bits are part of the default plan now: the
+        clear is measured on our own card, and taking it in this round is two rows
+        and one write-window trip cheaper than a later add-on round. The records
+        below are that plan -- the historical 12 plus chain1 blk8 (NVDEC), blk9
+        (bit146) and blk23's third field (bit371)."""
         obj = plan(self.dump)
+        self.assertEqual(
+            [(r["row"], r["chain"], r["block"], r["old"], r["new"],
+              r["record"]) for r in obj["burn"]],
+            [(241, 1, 6, "0x6000", "0x0000", "0x00000181"),
+             (242, 1, 7, "0x0198", "0x0180", "0x018001c1"),
+             (243, 1, 8, "0xf806", "0x0006", "0x00060201"),
+             (244, 1, 9, "0x0004", "0x0000", "0x00000241"),
+             (245, 1, 12, "0x0606", "0x0204", "0x02040301"),
+             (246, 1, 13, "0x0707", "0x4081", "0x40810341"),
+             (247, 1, 14, "0x8787", "0x1020", "0x10200381"),
+             (248, 1, 15, "0x07c7", "0x0008", "0x000803c1"),
+             (249, 1, 19, "0x4290", "0x4200", "0x420004c1"),
+             (250, 1, 20, "0x0620", "0x0420", "0x04200501"),
+             (251, 1, 23, "0x002f", "0x0000", "0x000005c1"),
+             (252, 2, 39, "0x0002", "0x0000", "0x000009c2"),
+             (253, 2, 47, "0x0008", "0x0000", "0x00000bc2"),
+             (254, 2, 49, "0x00c0", "0x0000", "0x00000c42")])
+        for key in ("pcie_devida", "pcie_devidb", "magic_d"):
+            self.assertNotIn(key, obj["targets"])
+        for key in ENGINE_KEYS:
+            self.assertEqual(obj["targets"][key], "0x0")
+
+    def test_no_mig_is_the_plan_before_the_engine_bits_were_default(self):
+        """The opt-out has to reproduce the historical plan exactly: the same 12
+        records this tool emitted before the media bits moved into the default,
+        and no engine field anywhere in it. What moved is only the sample's FF
+        *data*: it now also carries the factory media-engine bits, including one
+        more burnt record (chain1 blk9 = `0x00040241`, the stock bit146), which
+        shifts every planned row by one."""
+        obj = plan(self.dump, mig=False)
         self.assertEqual(
             [(r["row"], r["chain"], r["block"], r["old"], r["new"],
               r["record"]) for r in obj["burn"]],
@@ -480,14 +507,15 @@ class TestMediaUnlock(unittest.TestCase):
         """Both of our cards are in this state (measured 2026-11-25): the
         capability records are burnt, so nothing else rewrites blk8/blk23 any
         more and every engine bit has to carry a row of its own. Pretend the
-        sample card's default plan has been burnt and ask again."""
+        sample card's capability records have been burnt -- the media bits left
+        out, which is the state this warning exists for -- and ask again."""
         rows = dict(self.dump["ff_rows"])
-        for rec in plan(self.dump)["burn"]:
+        for rec in plan(self.dump, mig=False)["burn"]:
             # load_dump normalises rows to {int: int}, so the fake burn has to
             # write the same shape it would read back.
             rows[rec["row"]] = int(rec["record"], 16)
         burnt = dict(self.dump, ff_rows=rows)
-        obj = plan(burnt, mig=True)
+        obj = plan(burnt)
         self.assertEqual([r["record"] for r in obj["burn"]],
                          ["0x00060201", "0x00000241", "0x000005c1"])
         warn = " ".join(obj["warnings"])
@@ -545,26 +573,60 @@ class TestMediaUnlock(unittest.TestCase):
         self.assertEqual(nvdec["after"], 4)     # 5 minus the one that is gone
 
     def test_mig_report_prints_the_engine_section(self):
-        """`report` shows the engines and what the readout proves about them,
-        whether or not anything is being burnt."""
+        """`report` shows the engines, what the readout proves about them, and
+        what the default plan makes them -- which is unlocked, until `--no-mig`
+        says otherwise, in which case the section has to say so out loud."""
         rc, out = quiet(["report", SAMPLE])
         self.assertEqual(rc, 0)
         self.assertIn("[MIG / media engines]", out)
-        self.assertIn("NVDEC  0/5 live now -> unchanged", out)
-        self.assertIn("--mig", out)
+        self.assertIn("NVDEC  0/5 live now -> 5/5 after this plan", out)
         self.assertIn("floorsweep override (CTRL_OPT_*): INERT", out)
         self.assertIn("DISPLAY/DISP_HEAD", out)
+        rc, out = quiet(["report", SAMPLE, "--no-mig"])
+        self.assertEqual(rc, 0)
+        self.assertIn("NVDEC  0/5 live now -> unchanged", out)
+        self.assertIn("stays fused: --no-mig", out)
+        self.assertIn("`--no-mig` to leave them fused", out)
+
+    def test_a_planned_field_at_its_factory_value_clears_nothing(self):
+        """`--set nvdec_disable=0x1f` puts the field in the plan without clearing
+        it, and being in the plan is not the same as being cleared: the section
+        may promise decoders only where the target is actually 0. The engines the
+        default does clear are unaffected by one field's non-zero target."""
+        rep = analyze(self.dump, {"nvdec_disable": 0x1f}, mig_keys=ENGINE_KEYS)
+        by_label = dict((e["label"], e) for e in rep["media"]["engines"])
+        self.assertTrue(by_label["NVDEC"]["planned"])
+        self.assertFalse(by_label["NVDEC"]["cleared"])
+        self.assertEqual(by_label["NVDEC"]["after"], 0)
+        self.assertTrue(by_label["OFA"]["cleared"])
+        self.assertEqual(by_label["OFA"]["after"], 1)
+        rc, out = quiet(["report", SAMPLE, "--set", "nvdec_disable=0x1f"])
+        self.assertEqual(rc, 0)
+        self.assertIn("NVDEC  0/5 live now -> unchanged", out)
+        self.assertIn("a --set value not 0", out)
+        self.assertIn("NVJPG  0/1 live now -> 1/1 after this plan", out)
 
     def test_gen_mig_cli(self):
+        """`--mig` on by default, `--no-mig` taking the three engine records back
+        out of the plan, and `--mig` spelled out still accepted."""
         tmp = tempfile.mkdtemp(prefix="ffcalc-mig-")
         self.addCleanup(shutil.rmtree, tmp, True)
         path = os.path.join(tmp, "plan.json")
-        rc, out = quiet(["gen", SAMPLE, "-o", path, "--mig"])
+        for flags in ([], ["--mig"]):
+            rc, out = quiet(["gen", SAMPLE, "-o", path] + flags)
+            self.assertEqual(rc, 0)
+            with open(path) as f:
+                obj = json.load(f)
+            self.assertIn("0x00000241", [r["record"] for r in obj["burn"]])
+            self.assertIn("row cost of the media-engine bits", out)
+        rc, out = quiet(["gen", SAMPLE, "-o", path, "--no-mig"])
         self.assertEqual(rc, 0)
         with open(path) as f:
             obj = json.load(f)
-        self.assertIn("0x00000241", [r["record"] for r in obj["burn"]])
-        self.assertIn("row cost of --mig", out)
+        self.assertNotIn("0x00000241", [r["record"] for r in obj["burn"]])
+        for key in ENGINE_KEYS:
+            self.assertNotIn(key, obj["targets"])
+        self.assertNotIn("row cost of the media-engine bits", out)
 
     def test_engine_proof_words_exist_in_the_readout_map(self):
         """A proof key the probe does not read could never be satisfied, which

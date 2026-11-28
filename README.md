@@ -13,9 +13,9 @@
 
 | 命令 | 作用 |
 |---|---|
-| `scan --dir collected [--outdir cards --plans plans] [--mig] [--a100]` | 全表潜力分析 + 按 UUID 保存 dump 与计划；FF 行未知时不出计划（rc=1） |
+| `scan --dir collected [--outdir cards --plans plans] [--no-mig] [--a100]` | 全表潜力分析 + 按 UUID 保存 dump 与计划；FF 行未知时不出计划（rc=1） |
 | `report dump.json` | 单卡分析：硬行天花板、潜力、媒体引擎/MIG、运行时状态、熔丝身份 |
-| `gen dump.json -o plan.json [--ffrows ffrows.txt] [--mig] [--a100] [--only …] [--skip …] [--set k=v]` | 生成 FF 烧写记录（自动 16-bit 块合并）；FF 记录未读时拒绝出计划（rc=2，不写文件） |
+| `gen dump.json -o plan.json [--ffrows ffrows.txt] [--no-mig] [--a100] [--only …] [--skip …] [--set k=v]` | 生成 FF 烧写记录（自动 16-bit 块合并）；FF 记录未读时拒绝出计划（rc=2，不写文件） |
 | `sim dump.json plan.json [--ffrows ffrows.txt]` | 逐字段回放核对 |
 | `verify <plan> --dir collected [--ffrows ffrows.txt] \| --dump dump.json` | UUID / fingerprint / 回放 核验 |
 | `mergeff dump.json ffrows.txt` | 合并外部读出的 FF 行并报告覆盖是否完整 |
@@ -25,19 +25,22 @@
 | `burntool burn plan.json --dump dump.json --bdf … [--rows 315] [--force] [--yes]` | 断言式烧写（`docs/BURNING.md` §5） |
 | `burntool swiff plan.json [--dump …] [--rows …]` | 把计划记录作为易失 IFF 熔丝应用于本次启动，冷启动即撤销（`docs/BURNING.md` §6，本仓库未在实卡执行过） |
 
-常用参数：`--set fbp_disable=0x840` 钉目标值；`--only` / `--skip` 过滤字段，首条试烧建议 `--only fbp_disable`；`--allow-hard-floor` 允许目标值低于出厂缺陷底线（默认拒绝，见「硬行与 RIR」）。
+常用参数：`--set fbp_disable=0x840` 钉目标值；`--only` / `--skip` 过滤字段，首条试烧建议 `--only fbp_disable`；`--no-mig` 把媒体引擎三位退回出厂态；`--allow-hard-floor` 允许目标值低于出厂缺陷底线（默认拒绝，见「硬行与 RIR」）。
 
 ## 计划范围
 
-默认范围（不加参数）已放出该卡的全部算力并拿到 Gen4：
+默认范围（不加参数）已放出该卡的全部算力、拿到 Gen4，并解锁媒体引擎：
 
-| 范围 | 追加字段 | 结果 | 代价 |
+| 范围 | 字段 | 结果 | 代价 |
 |---|---|---|---|
-| 默认 | `fbp/fbio/fbpa/gpc/tpc/pes/rop_l2/nvlink/sys_pipe` + PCIe Gen3/4 | 80 GiB + 全 SM + NVLink + Gen4，卡仍为 `CMP 170HX` | 不碰 vBIOS；媒体引擎保持出厂关闭 |
-| `--mig` | 三个媒体引擎 floorsweep 位段 | 5 × NVDEC + NVJPG + OFA；MIG 从单一 `1g` 变为 `8g/4g/2g/1g` | 不可逆；与默认同轮通常只多 1 行，事后补烧 3 行 |
+| 默认 | `fbp/fbio/fbpa/gpc/tpc/pes/rop_l2/nvlink/sys_pipe` + PCIe Gen3/4 + 三个媒体引擎 floorsweep 位段 | 80 GiB + 全 SM + NVLink + Gen4 + 5 × NVDEC / NVJPG0 / OFA0 + MIG `8g/4g/2g/1g`，卡仍为 `CMP 170HX` | 媒体引擎不可逆；不碰 vBIOS |
+| `--no-mig` | 从默认里去掉那三位 | 媒体引擎保持出厂关闭，MIG 仍是单一 `1g`；其余照旧 | — |
+| `--mig` | 与默认完全相同（把三位显式写出来而已） | 同默认 | 老脚本与手写命令行仍可给 |
 | `--a100` | 熔丝 device id + `MAGIC_BITS_D` 整字 | 卡自称 A100 | 一次侵入式 vBIOS 刷写；平台需 128 GB MMIO 窗口；POST 失败只能离线刷 SPI |
 
-`--mig` 与 `--a100` 可同时给出，先后无关：引擎位在 chain1，身份与能力字在 chain2，互不重叠。
+媒体引擎三位现在是默认的一部分（`--mig` 只是把它显式写出来，`--no-mig` 才退出）。改默认的理由只有两条，且都是本机量出来的：收益已验证（5 路 NVDEC 硬件解码、NVJPG0、OFA0、MIG 多实例），而代价在同一轮里更便宜——与能力记录同轮时这些位搭在正被重写的块里，通常只多 1 行，事后再补是 3 行（两张已解锁卡实测），少一轮也就少一次进出写窗口。
+
+`--no-mig` 与 `--a100` 互不相干，先后无关：引擎位在 chain1，身份与能力字在 chain2，互不重叠。
 
 ## 使用流程
 
@@ -45,8 +48,8 @@
 
 ```sh
 git clone <repo> && cd ffcalc
-sudo bash scripts/ffscan.sh              # 默认范围
-sudo bash scripts/ffscan.sh --mig        # 追加媒体引擎
+sudo bash scripts/ffscan.sh              # 默认范围（含媒体引擎解锁）
+sudo bash scripts/ffscan.sh --no-mig     # 媒体引擎保持出厂关闭
 sudo bash scripts/ffscan.sh --a100       # 追加身份改写（--no-magic-d 只改 devid）
 ```
 
@@ -81,7 +84,7 @@ GPU-38bbb4b3-…-0cce33417b95              0000:05:00.0  80->80 GiB    124 fc497
 | `old` → `new` | 该 16-bit 块由真实 FF 快照回放出的当前值 → 烧后有效值；相邻字段的块合并为一条记录 |
 | `fields` | 该记录在该块内真正改动了哪些 option word 的位，即烧它的理由 |
 
-顶层另有 `uuid` / `fingerprint`（计划身份）、`targets`（各 option word 目标值）、`analysis`（FB/SM 潜力，含 `--mig` 时的 `analysis.mig` 与 `analysis.engines`、以及 `analysis.hard` 硬行天花板）、`warnings`。
+顶层另有 `uuid` / `fingerprint`（计划身份）、`targets`（各 option word 目标值）、`analysis`（FB/SM 潜力、`analysis.media` 媒体引擎与 MIG——默认计划就带，`--no-mig` 时其中 `planned` 为假——以及 `analysis.hard` 硬行天花板）、`warnings`。
 
 `cards/<uuid>.json` 是完整快照，计划由它推出：
 
@@ -138,9 +141,9 @@ FF 记录决定资源集合（可用 FBP/GPC/TPC/PES/ROP-L2、NVLink、SYS_PIPE�
 - **目标值清掉判死块的 disable 位不再出计划，而是 `REFUSED`（rc=2）**，`--allow-hard-floor` 显式放行。放行后的实测后果：`STATUS_OPT_FBP` 会跟随 `OPT_DISABLE`（影子寄存器不等于硅片还在），容量仍是硬天花板，且该卡 GSP-RM 起不来（`PTOP_GFW_BOOT=0x1`、`gsp_riscv_status=0`）。潜力一律按 `target | defective` 折算（FB 与 SM 两侧都是），所以 `--set fbp_disable=0x0` 在 10 活 2 死的卡上报 80 GiB，不再报 96 GiB。
 - **RIR 是唯一能盖住硬行的机制**：8 行 × 每行两条 16-bit 记录 = 16 槽，`rec = (abs_bit << 2) | (value << 1) | 1`，`abs_bit = 行*32 + 位`；记录把主阵列该位的**读数**替换成 value，双向都可以（把已烧成 1 的位读成 0 也行）。`rir` 命令只做纯解码。本 bench 的 8 GB SKU 卡由外部工具读出为 rows 0–6 全 `0xffffffff`、row7 `0xffff0923` ⇒ 16 槽全部耗尽（`0x0923` = 出厂在 `row18:bit8` 强制 1 的记录，与该卡 row18/row19 仅差 bit8 互为印证）。一个硬行位一条记录 ⇒ 这张卡的 64 GiB 天花板没有任何可写入口，与"我们不打算碰 RIR"是两条独立的理由。10 GB SKU 的槽位读数外部报告为全空，本 bench 未读过，故只按"可能但未证"记录。
 
-## 媒体引擎与 MIG（`--mig`）
+## 媒体引擎与 MIG（默认解锁，`--no-mig` 跳过）
 
-媒体引擎与 MIG 分片由 chain1（`TOP_FS`）的 floorsweep 位段控制，不是驱动按 `10de:20c2` 做的判断，也不是 VBIOS 锁。`--mig` 清除其中三个（`sys_pipe_disable` 默认计划本就清除）：
+媒体引擎与 MIG 分片由 chain1（`TOP_FS`）的 floorsweep 位段控制，不是驱动按 `10de:20c2` 做的判断，也不是 VBIOS 锁。默认计划清除其中三个（`sys_pipe_disable` 也在默认计划里）：
 
 | 字段 | 位置 | 出厂值 | 清除后 |
 |---|---|---|---|
@@ -151,7 +154,7 @@ FF 记录决定资源集合（可用 FBP/GPC/TPC/PES/ROP-L2、NVLink、SYS_PIPE�
 
 - **只能靠烧熔丝**：`FUSE_EN_SW_OVERRIDE(0x820040)=0` 时 `CTRL_OPT_*`（`0x82080c` NVJPG / `0x820824` NVDEC / `0x820a30` SYS_PIPE）的易失写推不动 `STATUS_OPT_*`，在写窗口内直接写 `0x820378`、`0x8203a4`、`0x820824`、`0x82080c` 同样无效。这条覆盖路只对 floorsweep 位失效；feature-override 岛（`0x8238xx`，速率/ECC/几何）是另一套机制，每启动被主机侧解锁程序写入。
 - **零缺陷证明**：这三个引擎无 `*_DEFECTIVE` 寄存器，硬件计算 `STATUS_OPT_* = OPT_DISABLE | OPT_DEFECTIVE`，故 `STATUS_OPT == OPT_DISABLE` 即无缺陷。实测两卡：`nvdec/status_nvdec = 0x1f/0x1f`、`nvjpg = 0x1/0x1`、`ofa = 0x1/0x1`、SYS_PIPE `0x8203a4/0x820e30 = 0` 且 `sys_pipe_defective = 0`。计划仅当快照读到相应 `OPT`+`STATUS` 对时才出行，缺字跳过并警告，`--set` 不能绕过。
-- **行代价**：记录写整块，故取决于本轮是否本来重写该块。与默认计划同轮为 1 行（仅 `blk9` 新增）；能力记录已烧完的卡为 3 行（`blk8`/`blk9`/`blk23` 各一行）。`gen --mig` 打印该卡本轮实测数字。
+- **行代价**：记录写整块，故取决于本轮是否本来重写该块。默认计划自己就是那一轮，实测 1 行（仅 `blk9` 新增）；能力记录已烧完、媒体位没烧的卡要 3 行（`blk8`/`blk9`/`blk23` 各一行）。`gen` 打印该卡本轮实测数字；`--no-mig` 时这些行根本不存在，日后想解锁就得付 3 行那一档。「默认就烧」正是取这个差价：同一批位，同轮做比后补便宜两行，且少一次进出写窗口。
 - `bit146` 与 `bit371` 与 NVJPG/OFA 的归属未分离（外部实测证明两位与两个 `OPT_*` 寄存器双射，但未分离谁对应哪个引擎），因此成对清除；`--only` 只清其一时计划会额外警告。
 - 边界：不证明 ECC（与这些位无关，无证据支持把两者混为一谈）；不放 AV1；不影响显存容量与 SM 数；`status_display(0x820c04)=0x1` / `status_disp_head(0x820c08)=0xf` 对应 chain1 bit 78..82，GA100 无显示输出，保持熔丝状态不清除。
 - 切换 MIG 模式（`nvidia-smi -mig 1/-mig 0`）触发驱动内 FLR，把易失几何打回出厂 8192 MiB，必须重启由解锁程序恢复。
@@ -166,7 +169,7 @@ FF 记录决定资源集合（可用 FBP/GPC/TPC/PES/ROP-L2、NVLink、SYS_PIPE�
 - `MAGIC_BITS_D(0x820520)=0x14680000`（CMP 出厂值）是 PCIe 能力宣告字，不代表实际速率，也不是启动门槛；清 bit25 即宣告 Gen4（默认计划已清，实测本仓库卡在整字未变时 Gen4 训练通过）。整字改写是本仓库的判断而非外部报告的步骤，`0x00200000` 无实测来源，故该计划会单独警告：不认可则 `--a100 --skip magic_d`，有真 A100 读数则 `--set magic_d=HEX`。
 - 冷启动后芯片自认 `10de:20b5`，lspci、驱动、GSP/DevInit 一律按 A100 识别。平台必须能分配 128 GB 的 64-bit prefetchable BAR1（`Above 4G Decoding` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G`），判据是 MMIO 窗口大小。
 - 平台 POST 失败时带内无退路，只能 CH341A + SOP8 夹离线刷 SPI。
-- 顺序：平台 BIOS 设置 → `nvflash --save` 备份本卡 CMP ROM → `ffscan.sh --a100 [--mig]` 出计划 → `verify` → 同一窗口内烧完 → 冷启动 → 刷 A100 vBIOS → 冷启动 → 重跑 `ffscan.sh` 确认 `[Fused device id]` 为 `0x20b5`。
+- 顺序：平台 BIOS 设置 → `nvflash --save` 备份本卡 CMP ROM → `ffscan.sh --a100` 出计划 → `verify` → 同一窗口内烧完 → 冷启动 → 刷 A100 vBIOS → 冷启动 → 重跑 `ffscan.sh` 确认 `[Fused device id]` 为 `0x20b5`。
 - 状态：改熔丝 devid → 刷 A100 ROM → 识别为 A100 80GB PCIe 这条路线出自外部实测报告；本仓库验证的是 FF 编码与记录格式自洽（`gen --a100` 生成的正是那两条记录），未在自己的卡上走过该路线。平台侧结果一律按未验证对待。
 
 ## FF 行读取不可用时的处置
@@ -194,8 +197,8 @@ FF 记录决定资源集合（可用 FBP/GPC/TPC/PES/ROP-L2、NVLink、SYS_PIPE�
 | burntool `REFUSED: …` | 1 | 计划、快照或窗口条件不满足，卡未被写入 |
 | burntool `ABORT: …` | 3 | 控制器锁死 / 超时 / 未授权：停止一切 BAR0 读 → 整机断电 → 重新进窗口先 `CMD_SENSE`（`docs/BURNING.md` §7）。断点续烧安全 |
 | burntool `plan warning:` / `NOTICE: … fused device id …` | 0 | 提示非错误：该计划改写熔丝 devid，后续欠一次 A100 vBIOS |
-| `WARN: nvjpg_ofa_disable_bit146/bit371: OPT_*/STATUS_OPT_* not in this snapshot` | 0 | 快照缺该对字，本轮不出行；重新采集后 `gen --mig` |
-| `WARN: row cost of --mig on this card: N extra FF row(s)` | 0 | 该卡本轮的真实行代价 |
+| `WARN: nvjpg_ofa_disable_bit146/bit371: OPT_*/STATUS_OPT_* not in this snapshot` | 0 | 快照缺该对字，本轮不出行；重新采集后 `gen`（媒体位本就在默认计划里） |
+| `WARN: row cost of the media-engine bits on this card: N extra FF row(s)` | 0 | 该卡本轮的真实行代价；`--no-mig` 时不出现该警告 |
 | `refusing to load the fuse probe` | 3 | 卡上有计算进程（`FFROWS=1` 时含解锁程序 keeper）；先停负载，`FORCE=1` 自行承担风险 |
 | `insmod: … Resource temporarily unavailable` | — | 正常：探测模块打印完毕 `return -EAGAIN` 自卸载 |
 

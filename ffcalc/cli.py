@@ -7,8 +7,8 @@ from .analyze import SS_THROTTLED, analyze
 from .dump import (BadSnapshot, atomic_write_json, load_dump, load_plan,
                    update_rows)
 from .generate import plan
-from .optionmap import (BY_KEY, DEVID_KEYS, FF_ROW_MAX, FF_ROW_MIN,
-                        TOTAL_SYS_PIPE)
+from .optionmap import (BY_KEY, DEVID_KEYS, ENGINE_KEYS, FF_ROW_MAX,
+                        FF_ROW_MIN, TOTAL_SYS_PIPE)
 from .simulate import simulate
 
 
@@ -414,6 +414,9 @@ def _print_media(rep):
     these engines have no ``*_DEFECTIVE`` word, so ``STATUS_OPT_*`` (which
     hardware computes as OPT | DEFECTIVE) is what says whether a row spent on
     them unlocks real silicon, and without that readout the plan skips them.
+    The number after "live now ->" is the engine's state where the plan really
+    clears the bits (target 0); a field that is planned at any other value left
+    the units off, and saying so is the difference between a report and a wish.
     """
     media = rep.get("media") or {}
     mig, engines = media.get("mig", {}), media.get("engines", [])
@@ -438,18 +441,20 @@ def _print_media(rep):
         print("  %-6s %d/%d live now -> %s after this plan "
               "(OPT=0x%x STATUS=0x%x: %s)%s"
               % (e["label"], e["now"], e["total"],
-                 ("%d/%d" % (e["after"], e["total"])) if e["planned"]
+                 ("%d/%d" % (e["after"], e["total"])) if e.get("cleared")
                  else "unchanged",
                  e["opt"], e["status"], verdict,
-                 "" if e["planned"] else "  [not in this plan: --mig]"))
-    if any(not e["planned"] for e in engines):
+                 "" if e.get("cleared") else "  [stays fused: --no-mig, --skip, "
+                                             "--only, or a --set value not 0]"))
+    if any(not e.get("cleared") for e in engines):
         print("  gates: NVDEC = chain1 blk8[15:11], NVJPG/OFA pair = blk9[2] + "
               "blk23[3] (which bit is which engine is not separated, so both "
               "go together). Row cost depends on whether this plan is already "
               "rewriting those blocks -- on a fresh card taking the default "
               "plan they ride along and only blk9 is new; on a card whose "
               "capability records are burnt already each of the three carries "
-              "its own row. `gen --mig` prints the exact count for this card")
+              "its own row. `gen` prints the exact count for this card, and the "
+              "bits are in its default plan (`--no-mig` to leave them fused)")
     disp = media.get("display") or {}
     if disp.get("read"):
         print("  chain1 bits 78..82 (DISPLAY/DISP_HEAD, STATUS=0x%x/0x%x): left "
@@ -504,6 +509,59 @@ def _print_devid(rep):
               "offline recovery of the SPI rom")
 
 
+def _add_mig_flag(parser):
+    """`--mig` / `--no-mig` on every verb that plans a burn or describes one.
+
+    The media-engine floorsweep bits are ON by default now, for two reasons that
+    are both measured on our own card: the payoff is real (5x NVDEC decode,
+    NVJPG0, OFA0, and 8 SYS_PIPEs making MIG more than one 1g instance), and
+    taking those bits in the same round as the capability records costs less than
+    a later add-on round -- 1 row riding in blocks that are being rewritten
+    anyway, against 3 rows for the same bits afterwards (measured on both of our
+    cards, already unlocked). Fewer rows used is not the only saving: one round
+    is one trip into the write window, and that window is the scarce thing.
+
+    `--no-mig` is the opt-out, and `--mig` stays accepted so old scripts and
+    muscle memory keep working. Neither flag bypasses the evidence rule: without
+    the OPT_*/STATUS_OPT_* readout in the snapshot the fields are skipped with a
+    warning, because a row spent on an engine that is not on the die is the one
+    mistake here that cannot be given back.
+    """
+    parser.add_argument(
+        "--mig", dest="mig", action="store_true", default=True,
+        help="burn the Chain-1 floorsweep bits that hold off the media engines: "
+             "nvdec_disable (chain1 blk8[15:11]) and the NVJPG/OFA pair (blk9[2] "
+             "+ blk23[3]). ON BY DEFAULT. Those engines are physically on the die "
+             "(5x NVDEC decode of H264/HEVC/VP9/MPEG2/JPEG -- no AV1, GA100's "
+             "NVDEC predates the GA10x AV1 block; NVJPG0 JPEG decode; OFA0 optical "
+             "flow) and only these fuses hold them off, so this is an "
+             "irreversible unlock, not a settings change. With sys_pipe_disable=0 "
+             "(also in the default plan) it makes MIG usable beyond one 1g "
+             "instance. Row cost depends on this plan: burn it together with the "
+             "capability records and the bits ride in blocks that are being "
+             "rewritten anyway (1 row, blk9), while a card whose unlock is burnt "
+             "already pays one row per bit (3 rows, measured) -- gen prints the "
+             "number for this card. Requires the OPT_*/STATUS_OPT_* readout (the "
+             "map grew): a snapshot taken before it cannot prove the units are "
+             "defect-free, and those fields are then skipped with a warning "
+             "instead of burned blind")
+    parser.add_argument(
+        "--no-mig", dest="mig", action="store_false",
+        help="leave the media-engine floorsweep bits as they are fused: no "
+             "NVDEC/NVJPG/OFA rows, and MIG stays the single non-partitionable "
+             "1g instance. Everything else in the plan is unaffected")
+
+
+def _mig_keys(on):
+    """The floorsweep fields the media unlock burns, or () for `--no-mig`.
+
+    Shared by the verbs that only *describe* a plan (`report`, `scan`'s table):
+    the verbs that write one get the same set from `plan(mig=...)`, which also
+    honors --only/--skip.
+    """
+    return ENGINE_KEYS if on else ()
+
+
 def _dispatch(argv=None):
     ap = argparse.ArgumentParser(prog="ffcalc",
                                  description="GA100 CMP 170HX FF fuse tool")
@@ -513,6 +571,7 @@ def _dispatch(argv=None):
     p.add_argument("dump")
     p.add_argument("--set", action="append", metavar="KEY=HEX",
                    help="override a target option value")
+    _add_mig_flag(p)        # the media bits are part of the plan `report` shows
 
     p = sub.add_parser(
         "defmap", help="re-derive, from one or more card snapshots, where the "
@@ -558,26 +617,7 @@ def _dispatch(argv=None):
     p.add_argument("--ffrows", metavar="FILE",
                    help="FF rows file to merge before planning "
                         "(see ffcalc mergeff)")
-    p.add_argument("--mig", action="store_true",
-                   help="also burn the Chain-1 floorsweep bits that hold off "
-                        "the media engines: nvdec_disable (chain1 blk8[15:11]) "
-                        "and the NVJPG/OFA pair (blk9[2] + blk23[3]). Those "
-                        "engines are physically on the die (5x NVDEC decode of "
-                        "H264/HEVC/VP9/MPEG2/JPEG -- no AV1, GA100's NVDEC "
-                        "predates the GA10x AV1 block; NVJPG0 JPEG decode; OFA0 "
-                        "optical flow) and only these fuses hold them off, so "
-                        "this is an irreversible unlock, not a settings change. "
-                        "With sys_pipe_disable=0 (already in the default plan) "
-                        "it also makes MIG usable beyond one 1g instance. Row "
-                        "cost depends on this plan: burn it together with the "
-                        "capability records and the bits ride in blocks that "
-                        "are being rewritten anyway (1 row, blk9), while a card "
-                        "whose unlock is burnt already pays one row per bit (3 "
-                        "rows, measured) -- gen prints the number for this card. "
-                        "Requires the OPT_*/STATUS_OPT_* readout (the map grew): "
-                        "a snapshot taken before it cannot prove the units are "
-                        "defect-free, and those fields are then skipped with a "
-                        "warning instead of burned blind")
+    _add_mig_flag(p)
     p.add_argument("--a100", action="store_true",
                    help="HIGH RISK (community-reported, not reproduced on our "
                         "cards): rewrite the FUSED device id 0x20c2 -> 0x20b5 "
@@ -620,14 +660,7 @@ def _dispatch(argv=None):
     p.add_argument("--sku", default="8gb", choices=("8gb", "10gb"))
     p.add_argument("--no-gen", action="store_true")
     p.add_argument("--skip", help="comma-separated keys to ignore in plans")
-    p.add_argument("--mig", action="store_true",
-                   help="plans also clear the media-engine floorsweep bits "
-                        "(5x NVDEC / NVJPG0 / OFA0, and multi-instance MIG "
-                        "beyond one 1g slice). Irreversible. Cost is 1 extra FF "
-                        "row when these bits ride the same round as the "
-                        "capability records, 3 rows on a card already unlocked "
-                        "(both measured); `gen --mig` prints the real number "
-                        "and what is and is not proven")
+    _add_mig_flag(p)
     p.add_argument("--a100", action="store_true",
                    help="HIGH RISK: plans rewrite the fused device id to "
                         "0x20b5 and the whole MAGIC_BITS_D word, which "
@@ -647,7 +680,8 @@ def _dispatch(argv=None):
 
     if args.cmd == "report":
         dump = load_dump(args.dump)
-        _print_analysis(analyze(dump, _parse_sets(args.set)))
+        _print_analysis(analyze(dump, _parse_sets(args.set),
+                                mig_keys=_mig_keys(args.mig)))
         return 0
 
     if args.cmd == "defmap":
@@ -792,7 +826,7 @@ def _dispatch(argv=None):
                     prev = None
                 if prev and prev.get("ff_rows"):
                     dump["ff_rows"] = prev["ff_rows"]
-            rep = analyze(dump)
+            rep = analyze(dump, mig_keys=_mig_keys(args.mig))
             dpath = ingest.save_dump(args.outdir, dump)
             pinfo = "-" if args.no_gen else "SKIPPED (FF rows not read)"
             pwarns = []

@@ -94,9 +94,10 @@ FIELDS = [
     # writes to the CTRL_OPT_*/OPT_* words never moved STATUS_OPT_*, even inside
     # the burn window -- which is why an FF record is the only lever for them.
     # (Scoped to this route: the 0x8238xx feature-override island is a separate
-    # mechanism and is written every boot; see analyze.runtime_state.) opt_in
-    # for all three: the default plan does not touch one bit of them, --mig
-    # asks.
+    # mechanism and is written every boot; see analyze.runtime_state.) They stay
+    # `opt_in` so nothing reaches them by accident (`--set nvdec_disable=0` alone
+    # is not enough), but the default plan does ask for them: the clear is
+    # measured on our own card, and `--no-mig` is what leaves them fused.
     OptionField("nvdec_disable", "NV_FUSE_OPT_NVDEC_DISABLE",
                 1, 139, 5, "engine", "",
                 "5x hardware video decode (H264/HEVC/VP9/MPEG2/JPEG; no AV1, "
@@ -182,8 +183,9 @@ DEVID_KEYS = ("pcie_devida", "pcie_devidb")
 CMP_DEVID = 0x20C2
 A100_DEVID = 0x20B5
 
-# The three Chain-1 media-engine bits `--mig` clears (see the long comments on
-# the fields above), and the two that only mean something as a pair.
+# The three Chain-1 media-engine bits the media unlock clears, i.e. what is in the
+# default plan and what `--no-mig` leaves alone (see the long comments on the
+# fields above), and the two that only mean something as a pair.
 ENGINE_KEYS = ("nvdec_disable", "nvjpg_ofa_disable_bit146",
                "nvjpg_ofa_disable_bit371")
 ENGINE_PAIR_KEYS = ("nvjpg_ofa_disable_bit146", "nvjpg_ofa_disable_bit371")

@@ -135,13 +135,13 @@ FF 记录决定资源集合，运行时寄存器决定本启动的实际状态�
 
 `ffcalc report` 的 `[Runtime state (BAR0, this boot)]` 段输出以上内容；快照中缺这些字时该项显示 `not read`，不会用 0 代替。
 
-## 9. 计划包含媒体引擎位（`--mig`）
+## 9. 计划包含媒体引擎位（默认在内，`--no-mig` 退出）
 
-`gen --mig` 追加 chain1 的三个 floorsweep 位段：`blk8[15:11]`（5 × NVDEC）、`blk9[2]`、`blk23[3]`（NVJPG0 + OFA0）。烧写动作与其他记录完全相同，§1–§7 规则一条不漏。
+chain1 的三个 floorsweep 位段——`blk8[15:11]`（5 × NVDEC）、`blk9[2]`、`blk23[3]`（NVJPG0 + OFA0）——在默认计划里；`--no-mig`（或 `MIG=0`）把它们拿掉，`--mig` 仍可显式写出。烧写动作与其他记录完全相同，§1–§7 规则一条不漏。放在默认里是因为同一轮做比后补便宜：同一批位在同轮里搭车重写块，实测 1 行，事后补烧 3 行，且少付一次开窗口成本（见 §12 与 README「计划范围」）。
 
 - **位段归属**：`bit146` 与 `bit371` 与 `{OPT_NVJPG_DISABLE(0x820370), OPT_OFA_DISABLE(0x8202d8)}` 的对应关系尚未分离，因此成对清除。
 - **零缺陷自证**：这三个引擎没有 `*_DEFECTIVE` 寄存器，硬件计算 `STATUS_OPT_* = OPT_DISABLE | OPT_DEFECTIVE`，故 `STATUS_OPT == OPT_DISABLE` 即零缺陷证据。实测：`nvdec_disable/status_nvdec = 0x1f/0x1f`、`nvjpg_disable/status_nvjpg = 0x1/0x1`、`ofa_disable/status_ofa = 0x1/0x1`，SYS_PIPE `0x8203a4/0x820e30` 均为 0 且 `sys_pipe_defective = 0`。计划只有在快照读到这四对字时才会为相应位出行，缺字即跳过并警告；`--set` 不能绕过。
-- **行代价**：本轮本来就要重写 `blk8`/`blk23` 时（新卡走默认计划）新增 1 行（承载 `blk9[2]`）；能力记录已烧完的卡三个位段各占一行，共 3 行。`gen --mig` 打印该卡本轮的真实数字。
+- **行代价**：本轮本来就要重写 `blk8`/`blk23` 时（新卡走默认计划）新增 1 行（承载 `blk9[2]`）；能力记录已烧完的卡三个位段各占一行，共 3 行。`gen` 打印该卡本轮的真实数字，`--no-mig` 时这份代价为零。
 - **烧后校验**：四个 `STATUS_OPT_*` 应读 0。任一仍非 0 表示该单元物理缺陷，不是烧写失败（FF 层回读等于新值即可），不得补烧。
 - `0x820c04` / `0x820c08`（DISPLAY / DISP_HEAD，chain1 bit 78..82）保持原样：GA100 无显示输出，清除它们没有收益。
 - **MIG 模式**：`nvidia-smi -mig 1/-mig 0` 触发驱动内 FLR，会把易失的 `FBPA_CFG1` / `LOCAL_MEMORY_RANGE` 打回出厂 8192 MiB，已在世的 slice 缩为 `1g.1gb`，因此切换 MIG 模式后必须重启，让主机侧解锁程序先恢复满容量几何。清 `sys_pipe_disable` 之后 `mig -lgip` 才出全套 profile 是外部报告的功能侧结论，本仓库未做 MIG 功能验证；本仓库确认的是该位段位置与 `SYS_PIPE` 的 `STATUS == OPT == 0`、`sys_pipe_defective = 0`。
@@ -156,7 +156,7 @@ FF 记录决定资源集合，运行时寄存器决定本启动的实际状态�
 - 平台必须给出 128 GB 的 64-bit prefetchable BAR1：`Above 4G Decoding` 开、`CSM` 关、`Re-Size BAR` 开、`MMIO High Size ≥ 128G`。判据是 MMIO 窗口大小。
 - 平台 POST 失败时带内无退路（驱动不在、nvflash 不可用），只能 CH341A + SOP8 夹离线刷 SPI。
 - `old` 列是 FF 层对该块的回放值：出厂在 FF 链中写了 `0x4184`（`0x20C2<<1`），正常显示 `0x4184 -> 0x416a`；若本次读出的行未覆盖承载 id 的记录，`old` 显示 `0x0000` 且计划额外警告——记录写的是整块新值，不受影响，但必须用 `ffcalc report` 的 `[Fused device id]`（读 `0x8204d8` / `0x82056c`）确认当前身份。
-- 与 `--mig` 同轮执行时，计划按链排序，chain1 的引擎位排在 chain2 的身份位之前，`burntool` 按计划顺序执行，因此中途断链留下的状态是"仍是 CMP 170HX、媒体引擎已放开"，而不是"熔丝已是 A100、ROM 未刷"。身份转换不会释放媒体引擎，那三位仍需清除。
+- 媒体引擎位默认就在同一份计划里，于是它与身份位同轮执行，计划按链排序，chain1 的引擎位排在 chain2 的身份位之前，`burntool` 按计划顺序执行，因此中途断链留下的状态是"仍是 CMP 170HX、媒体引擎已放开"，而不是"熔丝已是 A100、ROM 未刷"。身份转换不会释放媒体引擎：`--no-mig --a100` 时那三位仍是出厂关闭，日后要放开就付 §9 说的 3 行那一档。
 
 ## 11. 采集探针的操作规则
 
@@ -189,7 +189,7 @@ FF 记录决定资源集合，运行时寄存器决定本启动的实际状态�
 | `FUSEDEBUG` 非 0 | 外部报告称 bit1（RWL）选择 RIR 宏，读到的是 RIR 的 8 行而非主阵列（该后果未复现） | §4 判据要求 `FUSEDEBUG=0`，不满足即不得烧写 |
 | 影子读数与计划一致，但显存没变、GSP-RM 起不来（`PTOP_GFW_BOOT=0x1`、`gsp_riscv_status=0`） | 目标值清掉了 `*_DEFECTIVE` 置位的块：`STATUS_OPT_*` 跟的是 `OPT_DISABLE`，硬行位 FF 记录够不到 | 不是烧写失败也不是可救状态：`defmap` / `report` 的 `[Hard rows]` 段核对天花板；`gen` 默认拒绝该目标（`--allow-hard-floor` 才放行）。实测发生在 8 GB SKU 卡（`fbp_disable == fbp_defective == 0x2d`）|
 | `report` 报 `CROSS-CHECK FAILS` | 快照的 `fbpa`/`fbio`/`rop_l2_defective` 折算后与 `fbp_defective` 不等（三块实测 die 都等值，且都是每个 FBP 两位的编码） | 容量按 `fbp_defective` 读；查该快照是否混了两张卡或某寄存器读数被误映射 |
-| `--mig` 计划里没有 NVJPG/OFA 位 | 快照缺 `OPT_*`/`STATUS_OPT_*` 对 | 用当前采集表重跑 `ffscan.sh`；`--set` 不能绕过 |
+| 默认计划里没有 NVJPG/OFA 位 | 快照缺 `OPT_*`/`STATUS_OPT_*` 对，或给了 `--no-mig` | 用当前采集表重跑 `ffscan.sh`；`--set` 不能绕过缺字，`--mig` 只解决 `--no-mig` |
 | 烧完某个 `STATUS_OPT_*` 仍非 0 | 该单元物理缺陷 | 非烧写失败，不得补烧 |
 | 开/关 MIG 后显存显示 8192 MiB、slice 缩成 `1g.1gb` | 驱动内 FLR 恢复出厂几何 | 重启，让解锁程序先恢复几何 |
 | 烧完 devid 后卡不 POST | 熔丝为 A100、SPI 内为 CMP ROM | 刷 A100 80GB PCIe vBIOS；已挂死则 CH341A 离线刷 SPI |

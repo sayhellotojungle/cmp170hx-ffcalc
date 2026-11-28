@@ -45,7 +45,7 @@ def decode_current(blocks_by_chain):
     return {f.key: decode_field(blocks_by_chain, f) for f in FIELDS}
 
 
-def resolve_targets(dump, overrides=None):
+def resolve_targets(dump, overrides=None, mig_keys=()):
     """Target value per field, plus the warnings and the hard-floor violations.
 
     The default for every burnable field is its own ``*_DEFECTIVE``: the floor
@@ -53,10 +53,17 @@ def resolve_targets(dump, overrides=None):
     number the real ceiling rather than an aspiration. A target that clears one
     of those bits is recorded in `violations` -- see :func:`hard_state` for what
     that state actually does to a card.
+
+    `mig_keys` are the Chain-1 media-engine floorsweep fields the caller's plan
+    carries, which is the difference between the default plan and ``--no-mig``.
+    They default to 0 like any other burnable field, and they are held to the
+    same proof as an explicit ``--set``: no ``STATUS_OPT_*`` readout, no row.
     """
     words = dump["option_words"]
     info = _info_words(dump)
-    overrides = overrides or {}
+    overrides = dict(overrides or {})
+    for _key in mig_keys:
+        overrides.setdefault(_key, 0)
     targets = {}
     warnings = []
     violations = []
@@ -135,6 +142,10 @@ def _info_words(dump):
 def analyze_media(dump, targets, warnings, info=None):
     """What the media engines and MIG are now, and what the plan makes them.
 
+    Per engine the caller gets two separate answers: ``planned`` (the gating
+    fields are in this plan at all) and ``cleared`` (they are in it *at 0*, which
+    is what actually switches the units on). ``after`` follows ``cleared``.
+
     There is no ``*_DEFECTIVE`` register for NVDEC/NVJPG/OFA, but the defect
     state is still readable: hardware computes ``STATUS_OPT_* = OPT_DISABLE |
     OPT_DEFECTIVE``, so the two words agreeing proves the engine exists on this
@@ -149,9 +160,15 @@ def analyze_media(dump, targets, warnings, info=None):
     engines = []
     for label, opt_key, status_key, total, mask, gates in ENGINES:
         planned = all(k in targets for k in gates)
+        # Being in the plan is not the same as being cleared: the media bits are
+        # in the default plan at 0, but `--set nvdec_disable=0x1f` plans that
+        # field at its factory value, and the honest number for that engine is
+        # "still off". Reading `planned` as "cleared" is how a report ends up
+        # promising five decoders a plan does not deliver.
+        cleared = planned and not any(targets.get(k) for k in gates)
         e = {"label": label, "total": total, "keys": list(gates),
-             "read": False, "planned": planned, "now": None, "after": None,
-             "defective": None}
+             "read": False, "planned": planned, "cleared": cleared,
+             "now": None, "after": None, "defective": None}
         opt, status = info.get(opt_key), info.get(status_key)
         if opt is not None and status is not None:
             # Bits STATUS_OPT has that OPT_DISABLE does not = physical defects.
@@ -160,8 +177,8 @@ def analyze_media(dump, targets, warnings, info=None):
                       "defective": defect,
                       "now": total - popcount(opt & mask),
                       "after": total - popcount(
-                          (defect if planned else opt) & mask)})
-            if planned and defect:
+                          (defect if cleared else opt) & mask)})
+            if cleared and defect:
                 warnings.append(
                     "%s: STATUS_OPT has 0x%x beyond OPT_DISABLE, so %d of the "
                     "%d units are physically missing -- clearing the fuse "
@@ -171,10 +188,10 @@ def analyze_media(dump, targets, warnings, info=None):
         engines.append(e)
 
     # MIG is gated by SYS_PIPE, one pipe per GPC, and it is in the default plan
-    # already; what --mig adds is the media engines the profiles report as
-    # DEC/JPEG/OFA. 1 pipe is what makes `nvidia-smi mig -lgip` offer a single
-    # non-partitionable profile, which is the "MIG works but only 1g" that the
-    # community kept running into.
+    # already; what the media-engine bits add on top (`--no-mig` leaves them) are
+    # the engines the profiles report as DEC/JPEG/OFA. 1 pipe is what makes
+    # `nvidia-smi mig -lgip` offer a single non-partitionable profile, which is
+    # the "MIG works but only 1g" that the community kept running into.
     sp = words.get("sys_pipe_disable")
     sp_def = words.get("sys_pipe_defective", 0)
     sp_after = targets.get("sys_pipe_disable", sp)
@@ -357,8 +374,8 @@ def runtime_state(info):
     return out
 
 
-def analyze(dump, overrides=None):
-    targets, warnings, violations = resolve_targets(dump, overrides)
+def analyze(dump, overrides=None, mig_keys=()):
+    targets, warnings, violations = resolve_targets(dump, overrides, mig_keys)
     words = dump["option_words"]
     info = _info_words(dump)
     media = analyze_media(dump, targets, warnings, info)

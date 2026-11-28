@@ -26,7 +26,8 @@ EFFECTIVE = {
     "nvlink_disable": 0x7,
     "sys_pipe_disable": 0x2,
     # Media engines fused off, exactly as every CMP 170HX read out so far looks
-    # before --mig: all 5 NVDEC disable bits set, and both NVJPG/OFA bits set.
+    # before the media unlock (which the default plan performs; --no-mig leaves
+    # it): all 5 NVDEC disable bits set, and both NVJPG/OFA bits set.
     # They land in chain1 blk8[15:11], blk9[2] and blk23[3]; block merging is
     # what makes a plan write those blocks once, not three times.
     "nvdec_disable": 0x1F,
