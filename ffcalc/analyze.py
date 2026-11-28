@@ -1,4 +1,4 @@
-from . import ffrecord, ffrows
+from . import ffrecord, ffrows, hardrows, rir
 from .dump import int_value as _fuse_value
 from .optionmap import (BY_KEY, ENGINES, FIELDS, FF_ROW_MAX, FF_ROW_MIN,
                         TOTAL_FBP, TOTAL_GPC, TPC_PER_GPC, SM_PER_TPC,
@@ -46,11 +46,20 @@ def decode_current(blocks_by_chain):
 
 
 def resolve_targets(dump, overrides=None):
+    """Target value per field, plus the warnings and the hard-floor violations.
+
+    The default for every burnable field is its own ``*_DEFECTIVE``: the floor
+    the silicon allows, which is also what makes the default plan's capacity
+    number the real ceiling rather than an aspiration. A target that clears one
+    of those bits is recorded in `violations` -- see :func:`hard_state` for what
+    that state actually does to a card.
+    """
     words = dump["option_words"]
     info = _info_words(dump)
     overrides = overrides or {}
     targets = {}
     warnings = []
+    violations = []
     for f in FIELDS:
         if not f.burnable:
             continue
@@ -94,11 +103,20 @@ def resolve_targets(dump, overrides=None):
         if f.key in targets and f.defect_key and f.defect_key in words:
             defect = words[f.defect_key]
             if (targets[f.key] & defect) != defect:
+                violations.append(f.key)
                 warnings.append(
-                    "%s: target 0x%x does not contain defective 0x%x "
-                    "(would enable known-bad blocks)"
-                    % (f.key, targets[f.key], defect))
-    return targets, warnings
+                    "%s: target 0x%x does not contain defective 0x%x, so %d of "
+                    "those blocks are known bad. The shadow registers will still "
+                    "read the target (STATUS_OPT_* follows OPT_DISABLE; the "
+                    "defective mask does not force it back), and that is not "
+                    "success: on this bench's 8 GB card, clearing a dead FBP's "
+                    "disable bit left GSP-RM dead in the booter's instruction "
+                    "fetch (PTOP_GFW_BOOT=0x1, gsp_riscv_status=0). Only an RIR "
+                    "record overrules a hard row, and an 8 GB SKU card has no "
+                    "free RIR slot to put one in"
+                    % (f.key, targets[f.key], defect,
+                       popcount(defect & ~targets[f.key])))
+    return targets, warnings, violations
 
 
 def _info_words(dump):
@@ -197,6 +215,56 @@ def analyze_media(dump, targets, warnings, info=None):
                         "status": disp, "disp_head": heads}}
 
 
+def hard_state(words, sku, violations):
+    """The ceiling the hard rows impose, and what could still move it.
+
+    Three different numbers get confused with each other, so they are computed
+    separately here:
+
+    ``ceiling_gib``   what the silicon allows: ``12 - popcount(*_DEFECTIVE)`` FBP,
+                      times the per-FBP size of the SKU. ``*_DISABLE`` takes no
+                      part in it -- the masks live in hard rows, which an FF
+                      record cannot address at all (``ffcalc/hardrows.py``).
+    ``ff_headroom_gib`` what the FF pool can still buy on this card right now:
+                      the gap between today's ``fbp_disable`` and the floor. Zero
+                      here means "this card's plan buys no memory", which is the
+                      answer for a card whose ``disable`` equals its
+                      ``defective``.
+    ``records``       the RIR records that would lift the mask, one per dead FBP,
+                      and ``rir`` says whether such a record could be placed at
+                      all on this SKU.
+
+    ``violations`` are the fields whose target clears a bit ``*_DEFECTIVE`` sets.
+    The shadow registers do follow such a target (``STATUS_OPT_FBP`` tracks
+    ``OPT_DISABLE``, defective does not force it back), so a readout agreeing is
+    not success: on this bench's 8 GB card the un-disable was tried and GSP-RM
+    died in the booter's instruction fetch (``PTOP_GFW_BOOT`` 0x1,
+    ``gsp_riscv_status`` 0).
+    """
+    dead = hardrows.dead_fbps(words)
+    per = BYTES_PER_FBP.get(sku)
+    out = {"dead": dead, "ceiling_gib": None, "ceiling_fbp": None,
+           "ff_headroom_gib": None, "beyond": sorted(violations),
+           "located": hardrows.coord(hardrows.FBP_OFFSET, 12),
+           "rir": rir.route(sku), "records": [], "read": dead["mask"] is not None}
+    if not out["read"]:
+        return out
+    mask = dead["mask"]
+    out["ceiling_fbp"] = TOTAL_FBP - popcount(mask)
+    if per is not None:
+        out["ceiling_gib"] = out["ceiling_fbp"] * per
+    current = words.get("fbp_disable")
+    if current is not None and per is not None:
+        # What an FF record can hand back is exactly the set of partitions that
+        # are switched off but not dead. Written as an intersection rather than a
+        # subtraction: `disable` need not contain `defective` (a card left mid-
+        # experiment by an un-disable has disable bits missing where defective
+        # has them), and subtracting popcounts would go negative there.
+        out["ff_headroom_gib"] = popcount((current & ~mask) & 0xfff) * per
+    out["records"] = hardrows.rir_to_free(mask)
+    return out
+
+
 def runtime_state(info):
     """What the card is running on *this boot*, as read from BAR0.
 
@@ -266,11 +334,18 @@ def runtime_state(info):
     }
 
     iff = info.get("iff_record")
+    debugctrl = info.get("fuse_debugctrl")
     macro = {
         "crc": info.get("crc_status"), "efp": info.get("efp_status"),
         "dsov": info.get("dsov_status"),
         "en_sw_override": info.get("en_sw_override"),
-        "debugctrl": info.get("fuse_debugctrl"),
+        "debugctrl": debugctrl,
+        # bit1 (RWL) is the read multiplexer for the RIR macro: while it is set,
+        # a row read is an RIR row and not a main-array row. Nothing here sets it
+        # (that is a write, and RIR is not on our list), so it is reported only so
+        # a snapshot taken by somebody who did set it is not read as the array.
+        "rwl": None if debugctrl is None else bool(debugctrl & 0x2),
+        "debugctrl_plm": info.get("fuse_debugctrl_plm"),
         "priv_mask": info.get("priv_mask"),
         "plm_fuse_wdata": info.get("plm_fuse_wdata"),
         "wdata_wr_secure": info.get("wdata_wr_secure"),
@@ -283,12 +358,19 @@ def runtime_state(info):
 
 
 def analyze(dump, overrides=None):
-    targets, warnings = resolve_targets(dump, overrides)
+    targets, warnings, violations = resolve_targets(dump, overrides)
     words = dump["option_words"]
     info = _info_words(dump)
     media = analyze_media(dump, targets, warnings, info)
     runtime = runtime_state(info)
+    hard = hard_state(words, dump["sku"], violations)
 
+    # A target can only be realised down to the defective floor: the mask is a
+    # hard-row fact an FF record cannot overrule, so bits a target clears below it
+    # stay dead and do not count as capacity. Flooring here (rather than trusting
+    # the target) is what keeps `--set fbp_disable=0x0` from reporting 96 GiB on a
+    # card whose silicon has 8 alive.
+    fbp_floor = (hard["dead"]["mask"] or 0) if hard["read"] else 0
     fbp_cur = words.get("fbp_disable")
     fbp_tgt = targets.get("fbp_disable")
     usable_fbp = None
@@ -298,25 +380,39 @@ def analyze(dump, overrides=None):
         fb_now = (TOTAL_FBP - popcount(fbp_cur & 0xfff)) * \
             BYTES_PER_FBP[dump["sku"]]
     if fbp_tgt is not None:
-        usable_fbp = TOTAL_FBP - popcount(fbp_tgt & 0xfff)
+        usable_fbp = TOTAL_FBP - popcount((fbp_tgt | fbp_floor) & 0xfff)
         fb_gib = usable_fbp * BYTES_PER_FBP[dump["sku"]]
         if dump["sku"] == "8gb" and usable_fbp > 10:
             warnings.append(
                 "%d FBP usable -> %d GiB; production A100 caps at 10 FBP/80 "
                 "GiB, verify geometry encoding before trusting >80" %
                 (usable_fbp, fb_gib))
+        if fbp_floor & ~fbp_tgt:
+            raw_fbp = TOTAL_FBP - popcount(fbp_tgt & 0xfff)
+            warnings.append(
+                "fbp_disable target 0x%x clears %d FBP that fbp_defective marks "
+                "dead: the potential stays at the hard ceiling (%d GiB, %d FBP), "
+                "not the %d GiB the raw target implies -- the shadow words will "
+                "read the target, the memory will not be there"
+                % (fbp_tgt, popcount(fbp_floor & ~fbp_tgt), fb_gib, usable_fbp,
+                   raw_fbp * BYTES_PER_FBP[dump["sku"]]))
 
+    # Same flooring on the compute side: a GPC or TPC the factory marked dead does
+    # not come back because a disable bit was cleared.
     gpc_tgt = targets.get("gpc_disable", 0)
+    gpc_def = words.get("gpc_defective", 0) or 0
     tpc_tgts = [targets.get("tpc_gpc%d_disable" % i, 0) for i in range(TOTAL_GPC)]
+    tpc_defs = [words.get("tpc_gpc%d_defective" % i, 0) or 0
+                for i in range(TOTAL_GPC)]
     sm_count = None
     per_gpc = []
     if "gpc_disable" in targets:
         sm_count = 0
         for i in range(TOTAL_GPC):
-            if (gpc_tgt >> i) & 1:
+            if ((gpc_tgt | gpc_def) >> i) & 1:
                 per_gpc.append(0)
                 continue
-            t = TPC_PER_GPC - popcount(tpc_tgts[i] & 0xff)
+            t = TPC_PER_GPC - popcount((tpc_tgts[i] | tpc_defs[i]) & 0xff)
             per_gpc.append(t * SM_PER_TPC)
             sm_count += t * SM_PER_TPC
 
@@ -344,5 +440,6 @@ def analyze(dump, overrides=None):
         "pcie_gen4_ok": pcie_clear,
         "media": media,
         "runtime": runtime,
+        "hard": hard,
         "warnings": warnings,
     }

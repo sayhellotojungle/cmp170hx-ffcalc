@@ -63,6 +63,7 @@
     "status_pcie_lane": "0x00820c2c",
 
     "fuse_debugctrl": "0x00820060",
+    "fuse_debugctrl_plm": "0x00820054",
     "iff_record": "0x00820050",
     "crc_status": "0x00820070",
     "efp_status": "0x00820078",

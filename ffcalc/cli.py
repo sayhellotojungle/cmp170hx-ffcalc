@@ -2,7 +2,7 @@ import argparse
 import os
 import sys
 
-from . import ffrows, ingest
+from . import ffrows, hardrows, ingest, rir
 from .analyze import SS_THROTTLED, analyze
 from .dump import (BadSnapshot, atomic_write_json, load_dump, load_plan,
                    update_rows)
@@ -75,12 +75,22 @@ def _print_analysis(rep):
                      "captured and merged (ffcalc mergeff)"
                      % rep.get("ff_rows_state"))
     print("SKU: %s   FF rows: %s" % (rep["sku"], rows_desc))
+    _print_hard(rep)
     if rep["usable_fbp"] is not None:
         print("\n[Framebuffer potential]")
         print("  fbp_disable  current=0x%x  target=0x%x"
               % (w.get("fbp_disable", 0), rep["targets"].get("fbp_disable", 0)))
         print("  usable FBP: %d / 12" % rep["usable_fbp"])
         print("  potential framebuffer: %d GiB" % rep["fb_gib"])
+        hard = rep.get("hard") or {}
+        if hard.get("read") and hard["ceiling_gib"] is not None:
+            if rep["fb_gib"] == hard["ceiling_gib"]:
+                print("  (= the hard ceiling: *_DEFECTIVE, not the target, is what "
+                      "bounds this number)")
+            else:
+                print("  (hard ceiling %d GiB: this target leaves %d GiB that an FF "
+                      "record could still take back)"
+                      % (hard["ceiling_gib"], hard["ceiling_gib"] - rep["fb_gib"]))
     if rep["sm_count"] is not None:
         print("\n[SM potential]")
         print("  gpc_disable target=0x%x" % rep["targets"].get("gpc_disable", 0))
@@ -168,15 +178,232 @@ def _print_runtime(rep):
     if m:
         def word(v, fmt="0x%08x"):
             return "not read" if v is None else (fmt % v)
-        print("  fuse macro: CRC=%s DSOV=%s DEBUGCTRL=%s DIS_PROGRAM=%s "
-              "PRIV_MASK=%s FUSEWDATA_PLM=%s"
+        print("  fuse macro: CRC=%s DSOV=%s DEBUGCTRL=%s (PLM shadow %s) "
+              "DIS_PROGRAM=%s PRIV_MASK=%s FUSEWDATA_PLM=%s"
               % (word(m["crc"], "0x%02x"), word(m["dsov"], "%d"),
-                 word(m["debugctrl"], "0x%x"), word(m["dis_program"], "%d"),
+                 word(m["debugctrl"], "0x%x"), word(m["debugctrl_plm"], "0x%x"),
+                 word(m["dis_program"], "%d"),
                  word(m["priv_mask"]), word(m["plm_fuse_wdata"])))
+        if m.get("rwl"):
+            print("    DEBUGCTRL bit1 (RWL) set: the read multiplexer points at "
+                  "the RIR macro, so rows read in this state are the macro's 8 "
+                  "rows, not the main array. Nothing here sets that bit (it is a "
+                  "write), so this snapshot came from a tool that did")
         if m["iff_window"]:
             print("    IFF window rows %d-%d (from IFF_RECORD): the FF pool ends "
                   "at row %d" % (m["iff_window"][0], m["iff_window"][1],
                                  m["iff_window"][0] - 1))
+
+
+def _print_hard(rep):
+    """The hard-row side of the capacity question: what the silicon allows.
+
+    Printed apart from `[Framebuffer potential]` on purpose: that section is
+    about what a plan can do with the FF pool, this one is about the limit the FF
+    pool cannot move. A card can show headroom in one and none in the other, and
+    conflating them is how an unreachable number ends up in a burn order.
+    """
+    hard = rep.get("hard") or {}
+    print("\n[Hard rows (what the silicon allows, not the FF pool)]")
+    if not hard.get("read"):
+        print("  fbp_defective not in this snapshot: the ceiling is unknown, "
+              "not absent (re-capture: the readout map reads it at 0x8205cc)")
+        return
+    dead = hard["dead"]
+    print("  dead FBP: 0x%x (%s) from fbp_defective at %s"
+          % (dead["mask"],
+             ",".join(str(i) for i in dead["list"]) or "none",
+             hard["located"]))
+    if dead.get("anomalous"):
+        print("    ... of which 0x%x sits above the 12 partition bits: GA100 has "
+              "12 FBPs, so that part of the word is not a partition. The ceiling "
+              "here ignores it; re-check the readout before trusting the word"
+              % dead["anomalous"])
+    if dead["consistent"] is None:
+        print("    fbpa/fbio/rop_l2 defective not folded in: the same dead set is "
+              "marked in those three too, and this snapshot did not read them")
+    elif dead["consistent"]:
+        print("    fbpa/fbio/rop_l2 defective fold to the same set (the factory "
+              "marks one judgement in four words): snapshot is self-consistent")
+    else:
+        print("    CROSS-CHECK FAILS: %s fold to a different FBP set than "
+              "fbp_defective 0x%x. On this bench's three dies all four words mark "
+              "one judgement (fbpa/fbio/rop_l2 use two bits per FBP), so a "
+              "snapshot where they differ is either two cards mixed together or a "
+              "register that is not what the table says: read capacity off "
+              "fbp_defective alone and check the readout"
+              % (", ".join("%s -> 0x%x" % (k, v) for k, v in dead["mismatch"]),
+                 dead["mask"]))
+    if hard["ceiling_gib"] is not None:
+        print("  hard ceiling: %d GiB (%d FBP) -- a hard-row mask, so no FF "
+              "record moves it" % (hard["ceiling_gib"], hard["ceiling_fbp"]))
+    if hard["ff_headroom_gib"] is not None:
+        print("  buyable with FF records: %d GiB%s"
+              % (hard["ff_headroom_gib"],
+                 "" if hard["ff_headroom_gib"] else
+                 "  (nothing left to hand back: every partition this card still "
+                 "switches off is one the factory marked dead, so a burn here "
+                 "buys compute and capability, not memory)"))
+    if hard["records"]:
+        print("  the one lever that reaches a hard row is an RIR record: %d "
+              "needed (%s), one per dead FBP"
+              % (len(hard["records"]),
+                 " ".join("0x%04x" % r["record"] for r in hard["records"])))
+        print("    %s" % hard["rir"]["text"])
+
+
+def _fmt_values(values, limit=4):
+    """['a',0x840],... -> '0x840|0x840|0x2d', with a nod at which card is which."""
+    seen = []
+    for _name, value in values:
+        if value not in seen:
+            seen.append(value)
+    text = "|".join("0x%x" % v for v in seen[:limit])
+    if len(seen) > limit:
+        text += "|..."
+    if len(seen) == 1:
+        text += " (all samples)"
+    return text
+
+
+def _print_defmap(dumps, results):
+    """The solving report: the sample, the bit string, then one line a field."""
+    print("sample: %d snapshot(s): %s"
+          % (len(dumps), ", ".join(d.get("uuid") or d["source"]
+                                   for d in dumps)))
+    print("hard rows = factory rows 0-%d: %d logical words, each stored twice = "
+          "%d bits; a field may straddle a word (the 24-bit ones only solve that "
+          "way)" % (hardrows.FACTORY_ROW_MAX, hardrows.LOGICAL_WORDS,
+                    hardrows.FLAT_BITS))
+    same = None
+    silent = []
+    for d in dumps:
+        name = d.get("uuid") or d["source"]
+        if not any(0 <= row <= hardrows.FACTORY_ROW_MAX
+                   for row in d["ff_rows"]):
+            silent.append(name)
+            print("  %-40s no factory rows: a words-only readout, so it carries "
+                  "the option words and nothing to read them out of" % name)
+            continue
+        bad = hardrows.copy_mismatches(d["ff_rows"])
+        print("  %-40s %d redundancy pair(s) disagree (rows %s)"
+              % (name, len(bad), _fmt_rows(bad)))
+        if same is None:
+            same = set(bad)
+        elif same != set(bad):
+            same = None
+    if silent:
+        print("  %d of the above read no factory rows and take no part in the "
+              "solve: %s" % (len(silent), ", ".join(silent)))
+    if same:
+        print("  the disagreeing rows are the same rows on every die: those words "
+              "are simply not checked against their copy (CRC_STATUS is still "
+              "0x55). No field solved below lands in one")
+    print("")
+    print("%-24s %3s %9s %-22s %s"
+          % ("field", "w", "candidates", "shadow values", "reading"))
+    off_table = 0
+    ff_pool = 0
+    for r in results:
+        print("%-24s %3d %9d %-22s %s"
+              % (r["key"], r["width"], len(r["candidates"]),
+                 _fmt_values(r["values"]) if r["values"] else "not read",
+                 hardrows.verdict(r)))
+        if r["status"] == hardrows.STATUS_LOCATED and not r["in_hard_rows"]:
+            share = sorted(set(key for _off, keys in (r.get("overlaps") or ())
+                               for key in keys))
+            print("%snot a hard-row field. One offset still fits because every "
+                  "snapshot here reads the same value in this word as in %s; what "
+                  "separates them is a --pin of a value one die had when the two "
+                  "words differed"
+                  % (" " * 24, ", ".join(share)
+                     or "the word the table locates at that offset"))
+            ff_pool += 1
+        elif r["status"] == hardrows.STATUS_LOCATED and not r["reproduces"]:
+            print("%s this run disagrees with the built-in table (%s): more "
+                  "samples are needed to say which is right"
+                  % (" " * 24, ", ".join(hardrows.coord(o, r["width"])
+                                         for o in r["known"]) or "not listed"))
+            off_table += 1
+        if not r["in_hard_rows"]:
+            continue                       # already explained above
+        for off, shared in r.get("overlaps") or ():
+            print("%s%s would share %s with %s: two option words do not read one "
+                  "fuse bit, so this candidate is the least likely of the list"
+                  % (" " * 24, hardrows.coord(off, r["width"]),
+                     "a bit" if len(shared) == 1 else "bits",
+                     ", ".join(shared)))
+    if off_table:
+        print("\n%d field(s) solved differently from the table above" % off_table)
+    if ff_pool:
+        print("%d field(s) above are FF-pool words: the only offset that fits them "
+              "is one the table already assigns to a *_defective word, because on "
+              "these dies the two words read the same value" % ff_pool)
+    print("\nwhat this means: a *_defective word that solves to one position is a "
+          "hard-row mask, and the capacity ceiling is read from it; a *_disable "
+          "word with zero candidates is carried by the FF pool instead, which is "
+          "why burning one leaves the defective masks untouched")
+    return 0
+
+
+def _fmt_rows(rows, limit=12):
+    """A row list for printing, e.g. '18,48,50,...(+18)'."""
+    if not rows:
+        return "none"
+    text = ",".join(str(r) for r in rows[:limit])
+    return text + (",...(+%d)" % (len(rows) - limit) if len(rows) > limit else "")
+
+
+def _print_rir(inv, dump, allow_partial=False):
+    """Decode an RIR readout people brought us; no card access happens here."""
+    print("RIR macro: %d rows x two 16-bit records = %d slots"
+          % (rir.ROW_COUNT, rir.SLOT_COUNT))
+    by_row = {}
+    for s in inv["slots"]:
+        by_row.setdefault(s["row"], []).append(s)
+    for row in sorted(by_row):
+        cells = "  ".join("slot%-3d 0x%04x %s%s"
+                          % (s["slot"], s["value"], s["state"],
+                             ("  force %d @ row%d bit%d"
+                              % (s["record"]["value"], s["record"]["row"],
+                                 s["record"]["bit"]))
+                          if s["record"] else "")
+                          for s in sorted(by_row[row], key=lambda s: s["half"]))
+        print("  row %d  0x%08x  %s" % (row, inv["words"][row], cells))
+    for row in inv["missing"]:
+        print("  row %d  not read" % row)
+    read = 2 * (rir.ROW_COUNT - len(inv["missing"]))
+    print("free (blank) slots: %d%s; spent (no 0 cell left): %d; live records: %d"
+          % (inv["free"],
+             " of %d" % rir.SLOT_COUNT if inv["complete"] else
+             " counted, but only %d of %d slots were read (%d rows missing)"
+             % (read, rir.SLOT_COUNT, len(inv["missing"])),
+             inv["spent"], len(inv["live"])))
+    print("slot numbers assume the low half of a row is the even slot; the "
+          "external dump calls the same live record slot 15, so the half order "
+          "is not settled -- the raw words above are the evidence either way")
+    if dump is not None:
+        hard = analyze(dump)["hard"]
+        if not hard["read"]:
+            print("this snapshot has no fbp_defective: nothing to price")
+        else:
+            print("this card (%s): dead FBP %s, hard ceiling %s, and %d RIR "
+                  "record(s) (%s) would be needed to lift it"
+                  % (dump["sku"],
+                     "0x%x" % hard["dead"]["mask"],
+                     ("%d GiB" % hard["ceiling_gib"])
+                     if hard["ceiling_gib"] is not None else "unknown",
+                     len(hard["records"]),
+                     " ".join("0x%04x" % r["record"]
+                              for r in hard["records"])))
+            print("  %s" % hard["rir"]["text"])
+    if not inv["complete"] and not allow_partial:
+        print("FAIL: rows %s are not in this readout, and an unread row is not a "
+              "blank one: 'how many slots are free' has no answer. Pass "
+              "--partial if a partial picture is what you want to look at"
+              % _fmt_rows(inv["missing"]))
+        return 2
+    return 0
 
 
 def _print_media(rep):
@@ -287,6 +514,40 @@ def _dispatch(argv=None):
     p.add_argument("--set", action="append", metavar="KEY=HEX",
                    help="override a target option value")
 
+    p = sub.add_parser(
+        "defmap", help="re-derive, from one or more card snapshots, where the "
+                       "*_DEFECTIVE masks sit inside the factory (hard) rows")
+    p.add_argument("dumps", nargs="+", help="card snapshot json files")
+    p.add_argument("--pin", action="append", metavar="[CARD:]FIELD=HEX",
+                   help="assert that one die read FIELD=HEX in the hard rows at "
+                        "some point in its life, typically the value a field had "
+                        "before this repo burnt it (fbp_disable=0x852). Hard rows "
+                        "are static, so a die that would have to read two values "
+                        "at one offset leaves no offset standing: that is how a "
+                        "*_disable field is shown NOT to live here. CARD is a "
+                        "substring of the snapshot path or the UUID")
+    p.add_argument("--keys", help="comma-separated fields to report, in this "
+                                  "order (default: every *_defective the table "
+                                  "covers). A *_disable field named here is "
+                                  "reported too, which is how it is shown to have "
+                                  "no home in the hard rows; any --pin names a "
+                                  "field, it is added either way)")
+
+    p = sub.add_parser(
+        "rir", help="decode a captured RIR readout and count free slots "
+                    "(pure arithmetic: this command never touches the card)")
+    p.add_argument("readout", nargs="*", metavar="WORD",
+                   help="the 8 RIR row words in order, e.g. 0xffffffff x7 "
+                        "0xffff0923")
+    p.add_argument("--file", help="or a file of 'row 0xword' lines, as external "
+                                  "tools print them")
+    p.add_argument("--partial", action="store_true",
+                   help="show a readout that does not carry all 8 rows (the "
+                        "free-slot count then says how many rows were read: an "
+                        "unread row is not a blank row)")
+    p.add_argument("--dump", help="also show what this card's ceiling would cost "
+                                  "in RIR records")
+
     p = sub.add_parser("gen", help="generate FF burn records from a dump "
                        "(refuses if current FF records were not read)")
     p.add_argument("dump")
@@ -327,6 +588,17 @@ def _dispatch(argv=None):
                         "yourself, and a platform that fails to POST leaves "
                         "only CH341A recovery. Not needed for full capability "
                         "+ Gen4: the default plan covers that")
+    p.add_argument("--allow-hard-floor", action="store_true",
+                   help="with --set: let a target clear a bit that *_DEFECTIVE "
+                        "sets. Default is to refuse, because that state is not "
+                        "an ambitious plan but a different failure: the shadow "
+                        "registers follow OPT_DISABLE, so the readout agrees "
+                        "with the plan while the block stays dead -- on this "
+                        "bench's 8 GB card (fbp_disable == fbp_defective == "
+                        "0x2d) the un-disable left GSP-RM stuck at "
+                        "PTOP_GFW_BOOT=0x1. *_DEFECTIVE is a hard-row mask: no "
+                        "FF record can overrule it, and an 8 GB SKU card reads "
+                        "0 of 16 free RIR slots, the only lever that could")
 
     p = sub.add_parser("mergeff", help="merge an externally-read FF rows "
                        "dump (e.g. fuse macro CMD_READ) into a card dump")
@@ -378,6 +650,38 @@ def _dispatch(argv=None):
         _print_analysis(analyze(dump, _parse_sets(args.set)))
         return 0
 
+    if args.cmd == "defmap":
+        dumps = [load_dump(p) for p in args.dumps]
+        try:
+            pins = [hardrows.Pin.parse(p) for p in args.pin or ()]
+            results = hardrows.solve(dumps,
+                                     keys=args.keys.split(",") if args.keys
+                                     else None, pins=pins)
+        except ValueError as e:
+            print("FAIL: %s" % e)
+            return 2
+        return _print_defmap(dumps, results)
+
+    if args.cmd == "rir":
+        text = " ".join(args.readout)
+        if args.file:
+            try:
+                with open(args.file) as f:
+                    text += "\n" + f.read()
+            except IOError as e:
+                print("FAIL: cannot read %s (%s)" % (args.file, e))
+                return 2
+        try:
+            words = rir.parse_words(text)
+        except (rir.BadRirRecord, ValueError) as e:
+            print("FAIL: %s" % e)
+            print("want the 8 RIR row words, e.g. `ffcalc rir %s` or --file"
+                  % " ".join("0x%08x" % w for w in rir.MEASURED_8GB))
+            return 2
+        return _print_rir(rir.inventory(words),
+                          load_dump(args.dump) if args.dump else None,
+                          allow_partial=args.partial)
+
     if args.cmd == "mergeff":
         try:
             rows = ffrows.parse_file(args.rows)
@@ -413,10 +717,15 @@ def _dispatch(argv=None):
         try:
             obj = plan(dump, only=only, skip=skip,
                        overrides=_parse_sets(args.set), a100=args.a100,
-                       mig=args.mig)
+                       mig=args.mig,
+                       allow_hard_floor=args.allow_hard_floor)
         except ffrows.FFRowsNotRead as e:
             print("REFUSED: %s" % e.detail)
             print("how to fix: %s" % ffrows.GUIDANCE)
+            print("no burn plan was written to %s" % args.out)
+            return 2
+        except hardrows.BeyondHardFloor as e:
+            print("REFUSED: %s" % e)
             print("no burn plan was written to %s" % args.out)
             return 2
         # Atomic: a half-written plan is worse than no plan, because whoever
@@ -432,6 +741,12 @@ def _dispatch(argv=None):
                      rec["old"], rec["new"], ",".join(rec["fields"])))
         a = obj["analysis"]
         print("potential: %s GiB FB, %s SMs" % (a["fb_gib"], a["sm_count"]))
+        hard = a.get("hard") or {}
+        if hard.get("read") and hard["ceiling_gib"] is not None:
+            print("hard ceiling: %d GiB (%d dead FBP at %s); FF headroom on this "
+                  "card: %s GiB"
+                  % (hard["ceiling_gib"], len(hard["dead"]["list"]),
+                     hard["located"], hard["ff_headroom_gib"]))
         _print_media({"media": a["media"]})   # same shape as `report`
         for msg in obj["warnings"]:
             print("WARN: %s" % msg)
@@ -583,6 +898,12 @@ def main(argv=None):
         return _dispatch(argv)
     except BadSnapshot as e:
         print("FAIL: %s" % e)
+        return 2
+    except hardrows.BeyondHardFloor as e:
+        # A plan asked for a state the FF pool cannot deliver (`scan` reaches it
+        # too, since it plans every card it collects): say what and stop, rather
+        # than let a caller read a potential number off a traceback.
+        print("REFUSED: %s" % e)
         return 2
 
 

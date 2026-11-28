@@ -10,7 +10,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ffcalc import capture, cli, ffmacro, ffrecord, ffrows, ingest
+from ffcalc import (capture, cli, ffmacro, ffrecord, ffrows, hardrows, ingest,
+                    rir)
 from ffcalc import dump as snapshot
 from ffcalc.analyze import analyze
 from ffcalc.dump import load_dump
@@ -145,9 +146,26 @@ class TestDump(unittest.TestCase):
         self.assertTrue(all(r >= 238 for r in rows))
 
     def test_overrides_flow_into_targets(self):
-        obj = plan(self.dump, overrides={"fbp_disable": 0x0})
+        """A target above the defective floor is planning material; one *below*
+        it is a different failure mode and `plan` says so (see BeyondHardFloor)."""
+        obj = plan(self.dump, overrides={"gpc_disable": 0x0})
+        self.assertEqual(obj["targets"]["gpc_disable"], "0x0")
+        with self.assertRaises(hardrows.BeyondHardFloor):
+            plan(self.dump, overrides={"fbp_disable": 0x0})
+
+    def test_a_target_below_the_hard_floor_costs_nothing_and_says_so(self):
+        """Clearing the disable bit of a dead FBP moves the shadow registers and
+        not the memory, so the potential must stay at the hard ceiling -- the
+        claim `--allow-hard-floor` is allowed to make must be the true one."""
+        obj = plan(self.dump, overrides={"fbp_disable": 0x0},
+                   allow_hard_floor=True)
         self.assertTrue(any("does not contain defective" in w
                             for w in obj["warnings"]))
+        self.assertEqual(obj["analysis"]["fb_gib"], 80)   # not 96: 2 FBP are dead
+        self.assertEqual(obj["analysis"]["hard"]["beyond"], ["fbp_disable"])
+        rep = analyze(self.dump, {"fbp_disable": 0x0})
+        self.assertEqual(rep["hard"]["ceiling_gib"], 80)
+        self.assertTrue(any("hard ceiling" in w for w in rep["warnings"]))
 
     def test_plan_refused_without_ff_rows(self):
         for rows in ({}, {222: 0x141, 223: 0x181}):

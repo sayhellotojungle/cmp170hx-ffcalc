@@ -27,11 +27,23 @@ FUSECTRL = 0x00820000
 FUSEADDR = 0x00820004
 FUSEDATA = 0x00820008
 FUSEWDATA = 0x0082000C    # record WRITE port (FUSEDATA is read-only)
-FUSEDEBUG = 0x00820060    # community name DEBUGCTRL; bit 1 = RWL, which the
-                          # community map says selects the RIR macro, so a
-                          # non-zero word would send an FF record to rows 0-7
-                          # (not reproduced here). The assertion is simply that
-                          # the whole word reads 0 before arming.
+FUSEDEBUG = 0x00820060    # community name DEBUGCTRL. Bit 1 (RWL) switches the
+                          # read mux to the RIR macro: with it set, FUSEADDR 0-7
+                          # + CMD_READ answers the eight RIR rows instead of
+                          # main-array rows 0-7 (read that way on this bench's
+                          # 8 GB card by an external tool; this repo never touches
+                          # the bit and takes RIR contents from a captured
+                          # readout: `ffcalc rir --file`). Either way a non-zero
+                          # word is fatal for an FF read or burn: the macro would
+                          # be looking at the wrong array, so the assertion stays
+                          # "the whole word reads 0".
+FUSE_DEBUGCTRL_PLM = 0x00820054  # privilege word for the debug ctrl. External
+                          # reports quote 0xff; the bench read 0x33 while RWL
+                          # still latched, so it is reported and never used as a
+                          # criterion -- "did the bit stick when it was written"
+                          # is the test that means anything. Read-only here.
+DEBUGCTRL_RWL = 0x2       # FUSEDEBUG bit 1: read mux -> RIR macro. Documented,
+                          # never written by this tool (RIR is read, not burnt).
 EN_SW_OVERRIDE = 0x00820040
 IFF_RECORD = 0x00820050   # IFF window: start = v & 0x1ff, last = (v >> 16) & 0x1ff
 PMC_BOOT_0 = 0x00000000
@@ -141,13 +153,19 @@ def wait_idle(rd, sleep=time.sleep, clock=time.monotonic, timeout=1.0):
 
 
 def status(rd):
-    """Burn-relevant registers, as {name: int}."""
+    """Burn-relevant registers, as {name: int}.
+
+    FUSE_DEBUGCTRL_PLM is in here because an external report gives it as 0xff and
+    a reader should be able to see for themselves what the card says: it is
+    information only, the window criteria below never look at it.
+    """
     return {"PMC_BOOT_0": rd(PMC_BOOT_0), "FUSECTRL": rd(FUSECTRL),
             "FUSEADDR": rd(FUSEADDR), "FUSEDATA": rd(FUSEDATA),
             "FUSEDEBUG": rd(FUSEDEBUG), "CRC_STATUS": rd(CRC_STATUS),
             "EFP_STATUS": rd(EFP_STATUS), "DIS_PROGRAM": rd(DIS_PROGRAM),
             "DSOV_STATUS": rd(DSOV_STATUS), "IFF_RECORD": rd(IFF_RECORD),
             "EN_SW_OVERRIDE": rd(EN_SW_OVERRIDE),
+            "FUSE_DEBUGCTRL_PLM": rd(FUSE_DEBUGCTRL_PLM),
             "PLM_FUSE_WDATA": rd(PLM_FUSE_WDATA), "PRIV_MASK": rd(PRIV_MASK),
             "SBFE_SHADOW": rd(SBFE_SHADOW),
             "WDATA_WR_SECURE": rd(WDATA_WR_SECURE)}

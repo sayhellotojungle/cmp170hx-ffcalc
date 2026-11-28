@@ -8,15 +8,17 @@
 
 | 行区间 | 性质 |
 |---|---|
-| 0–221 | 出厂 OTP。只读，**禁止写入** |
+| 0–221 | 出厂 OTP（硬行）。只读，**禁止写入**；`*_DEFECTIVE` 掩码在这一区，FF 记录寻不到它（见 README「硬行与 RIR」与 `ffcalc/hardrows.py`） |
 | 222–487 | FF 池（266 行），烧写计划唯一允许使用的区间 |
 | 488–507 | IFF 窗口（易失，冷启动失效） |
 | 508–511 | 未使用 |
+| 宏：RIR | 物理独立的 8 行 × 每行 2 条 16-bit 记录；读它要把 `FUSEDEBUG(0x820060)` 的 bit1 置 1（该位是写操作）。本仓库不读不写，只解码外部读数（`ffcalc/rir.py`） |
 
 - 上界来源：卡自己上报 `IFF_RECORD(0x820050) = 0x01fb01e8` → start `0x1e8`=488、last `0x1fb`=507。FF 池到 `IFF_ROW_MIN - 1` = 487 为止，不是估值。
 - `ffmacro.program_row()` 对行号做硬断言，区间外的行一律拒绝；这层保护独立于计划生成器。
 - 禁止写入清单：行 0 与行 1。外部报告称对这两行写全 1 会使融合控制器永久锁死；该后果不去验证，规则按禁止执行，代码层同样拒绝。
 - 熔丝只能 0→1。同一链内后写的记录覆盖先写的记录，因此新记录必须追加在该卡最后一条已烧行之后。
+- 硬行的"每行都有等值副本"不完全成立：实测三块 die 都有同样的 21 行两份不等值（18、48–80 偶数、84、86、94），而 `CRC_STATUS` 仍为 `0x55`，说明这些字不跨副本比对。`hardrows.factory_words()` 取偶数行副本（本仓库 8 GB 卡的 row18/row19 仅差 bit8，正是该卡出厂 RIR 记录 `0x0923` 补的那个位）；`hardrows.copy_mismatches()` 把它作为快照事实报出，`defmap` 打印。求解出的字段都不落在这 21 行内。
 
 ## 2. FF 记录格式
 
@@ -37,7 +39,8 @@ bits[15:6] = 16-bit 块号   bits[31:16] = 块的新值
 | `FUSEWDATA` | `0x82000c` | 记录写入口，PROGRAM 之前写这里 |
 | `IFF_RECORD` | `0x820050` | `0x01fb01e8`：IFF 窗口 488–507 |
 | `EN_SW_OVERRIDE` | `0x820040` | 0（出厂）；`CTRL_OPT_*` floorsweep 覆盖路的总开关 |
-| `FUSEDEBUG` | `0x820060` | 必须为 0。bit1 = RWL，文献记为 RIR 宏选择位（为 1 时 FF 记录会以 RIR 写入落到行 0–7；该后果本仓库未复现，判据按整字必须为 0 执行） |
+| `FUSEDEBUG` | `0x820060` | 必须为 0。bit1 = RWL，文献记为 RIR 宏选择位（为 1 时读到的行是 RIR 的 8 行而非主阵列；该后果本仓库未复现，判据按整字必须为 0 执行）。置这一位是**写**操作，故 words 通道不读 RIR |
+| `FUSE_DEBUGCTRL_PLM` | `0x820054` | 外部报告称 `0xff`；本 bench 读 `0x33`。`FUSEDEBUG` 的 PLM 影子（只影响写权限，不改 bit1 的"必须为 0"判据），故仅作信息，不参与任何判据 |
 | `CRC_STATUS` | `0x820070` | `0x55` = 链 CRC 健康；烧写后仍为 `0x55`，CRC 由控制器自动重算 |
 | `EFP_STATUS` | `0x820078` | 1 |
 | `DIS_PROGRAM` | `0x82007c` | 0；为 1 表示编程被禁止 |
@@ -157,7 +160,7 @@ FF 记录决定资源集合，运行时寄存器决定本启动的实际状态�
 
 ## 11. 采集探针的操作规则
 
-`scripts/ffscan.sh` 从 `ffcalc/data/ga100-fuses.json` 生成 `ffprobe.ko`：`ioremap(bar0, PROBE_MAPLEN)` → `readl` 全表（105 词）→ 可选 `CMD_READ` 512 行 → `pr_info` → 自卸载（`return -EAGAIN`）。规则：
+`scripts/ffscan.sh` 从 `ffcalc/data/ga100-fuses.json` 生成 `ffprobe.ko`：`ioremap(bar0, PROBE_MAPLEN)` → `readl` 全表（106 词，不含 RIR 宏：切读 RIR 要写 `FUSEDEBUG` bit1，words 通道就不再是零写入）→ 可选 `CMD_READ` 512 行 → `pr_info` → 自卸载（`return -EAGAIN`）。规则：
 
 - **只在卡空闲时加载。** `ffscan.sh` 检测到计算进程时拒绝 `insmod`（rc=3）；`FFROWS=1` 时主机侧解锁程序的 keeper 进程也视为占用。`FORCE=1` 是显式承担后果的覆盖开关，不是常规参数。
 - **映射长度由寄存器表自动推导**（当前 `0x9a5000`，覆盖到 `0x9a3c7c` 的 FB/HBM 侧寄存器）。表项超出 `ioremap` 范围时 `readl` 不产生干净错误：本仓库在该状态下遇到过 `insmod` 被内核终止、整机需要重启。两层防护：生成器在表项超出 BAR0 时拒绝生成；模块内做运行时边界检查，越界表项打印 `SKIPPED` 而不读取。
@@ -169,7 +172,10 @@ FF 记录决定资源集合，运行时寄存器决定本启动的实际状态�
 - 一次完整烧写闭环：17 条记录，行 304–320，`fbp 0x852→0x840`、`fbpa/fbio/rop_l2 0xc0330c→0xc03000`、`gpc→0x20`、`tpc4→0x40`、`tpc7→0x20`、`pes→0x38000`、`nvlink/sys_pipe→0`、Gen4 位清零（block39 的两个 `DISABLE_GEN3_SPEED` 位 + `MAGIC_BITS_D` bit25）。冷启动后 `PMC_BOOT_0 = 0x170000a1`、`CRC_STATUS = 0x55`、FF 区除新 17 行外零改动、defective 全部不变。
 - 两卡当前状态：512 行快照齐全，`plans/*.burn.json` 为 0 记录（潜力已全部落地）；`GPU-38bbb4b3…` 124 SM / `fc497d01b8255867`，`GPU-85b20be7…` 108 SM / `3ab5093e8f9f78b5`（该卡 `gpc_disable = gpc_defective = 0x20`，即一个 GPC 由硅片缺陷限制）。
 - `tpc_gpc3/6_disable` 的 **status 层读 0x1、fused 层读 0x0**，两张卡一致。两层不一致说明该位当前不是由熔丝决定；fused 层已为 0，向这两个位补烧记录不会改变 status 读数。
-- fingerprint 由全部 `*_DEFECTIVE` 字与 SBFE 位哈希而来，物理缺陷不随烧写与重启变化；同批次卡的烧前指纹可能与另一张卡的烧后指纹相同，因此**认卡与对计划以 UUID 为准**，fingerprint 仅用于确认同一块 die 的前后一致。
+- 硬行侧基线（三张卡）：`*_DEFECTIVE` 的位置用 `defmap` 从快照重算，`fbp_defective` = 行26 bit16..27 唯一解，`pes_defective` = 行34 bit20..行36 bit11 唯一解；三块 die 的"两份不等值"行号完全相同（21 行：18、48–80 偶数、84、86、94），`CRC_STATUS` 同时仍为 `0x55`。`fbpa`/`fbio`/`rop_l2_defective` 是每个 FBP 两位的编码，折算后与 `fbp_defective` 逐位一致（三张卡都是），所以四寄存器一份判断可当快照自检用。
+- 显存容量的两条实测边界：`GPU-b6b9f653…`（8 GB SKU，`fbp_defective = 0x2d`）64 GiB 是硅片限制，FF 记录无从改动；把该行 disable 位清掉后 `STATUS_OPT_FBP` 跟着目标变成 0x1f，但 `PTOP_GFW_BOOT` 读 `0x1`、`gsp_riscv_status` 为 0（GSP-RM 停在 booter 取指），冷启动仍是 64 GiB。**影子读数通过不是容量类计划的成功判据。**
+- 同卡 RIR 由外部工具读出为 rows 0–6 全 `0xffffffff`、row7 `0xffff0923`：16 个槽位全部耗尽，`0x0923` 解出行18 bit8 强制 1，与该卡 row18/row19 仅差 bit8 互为印证。一个硬行位需一条记录 ⇒ 该卡的天花板在本卡上没有可写入口。本仓库不读也不写该宏（切换读多路器要写 `FUSEDEBUG` bit1）。
+- 复核（卡上有负载时）：`FORCE=1 FFROWS=0` 在负载卡上能拿到新的寄存器读数（探针打印完读数后以 `-EAGAIN` 退出、不常驻），但拿不到行读数——快照里的 512 行因此是上次采集的。两卡的 option word 与上次逐字相同（熔丝读数幂等再确认）。`FUSE_DEBUGCTRL` 读 `0x0`：读多路器指向主阵列，快照里的行就是主阵列的行。`FUSE_DEBUGCTRL_PLM` 两块 die 都读 `0x33`（外部 dump 记 `0xff`）：它是写权限侧的影子，不参与任何判据。
 
 ## 13. 速查
 
@@ -180,7 +186,9 @@ FF 记录决定资源集合，运行时寄存器决定本启动的实际状态�
 | 冷启动后 `SBFE_SHADOW` 仍为 1 | 冷启动恢复默认值 | `DSOV=0` 时写 0 即授权，属正常 |
 | `DSOV=0` 但写入不生效 | `PRIV_MASK` / `PLM_FUSE_WDATA` 未放开（近失状态） | 不是可用窗口，重新冷启动 |
 | `FUSECTRL` 读 `0xBADFxxxx` | 命令失败，控制器锁死 | 停止读 → 断电冷启动 → `CMD_SENSE` 评估（§7） |
-| `FUSEDEBUG` 非 0 | 外部报告称 bit1（RWL）选择 RIR 宏，FF 记录会落到行 0–7（该后果未复现） | §4 判据要求 `FUSEDEBUG=0`，不满足即不得烧写 |
+| `FUSEDEBUG` 非 0 | 外部报告称 bit1（RWL）选择 RIR 宏，读到的是 RIR 的 8 行而非主阵列（该后果未复现） | §4 判据要求 `FUSEDEBUG=0`，不满足即不得烧写 |
+| 影子读数与计划一致，但显存没变、GSP-RM 起不来（`PTOP_GFW_BOOT=0x1`、`gsp_riscv_status=0`） | 目标值清掉了 `*_DEFECTIVE` 置位的块：`STATUS_OPT_*` 跟的是 `OPT_DISABLE`，硬行位 FF 记录够不到 | 不是烧写失败也不是可救状态：`defmap` / `report` 的 `[Hard rows]` 段核对天花板；`gen` 默认拒绝该目标（`--allow-hard-floor` 才放行）。实测发生在 8 GB SKU 卡（`fbp_disable == fbp_defective == 0x2d`）|
+| `report` 报 `CROSS-CHECK FAILS` | 快照的 `fbpa`/`fbio`/`rop_l2_defective` 折算后与 `fbp_defective` 不等（三块实测 die 都等值，且都是每个 FBP 两位的编码） | 容量按 `fbp_defective` 读；查该快照是否混了两张卡或某寄存器读数被误映射 |
 | `--mig` 计划里没有 NVJPG/OFA 位 | 快照缺 `OPT_*`/`STATUS_OPT_*` 对 | 用当前采集表重跑 `ffscan.sh`；`--set` 不能绕过 |
 | 烧完某个 `STATUS_OPT_*` 仍非 0 | 该单元物理缺陷 | 非烧写失败，不得补烧 |
 | 开/关 MIG 后显存显示 8192 MiB、slice 缩成 `1g.1gb` | 驱动内 FLR 恢复出厂几何 | 重启，让解锁程序先恢复几何 |

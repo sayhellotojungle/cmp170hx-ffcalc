@@ -1,8 +1,8 @@
-from . import ffrecord, ffrows
+from . import ffrecord, ffrows, hardrows
 from .analyze import analyze, replay_blocks, used_ff_rows
-from .optionmap import (A100_DEVID, A100_MAGIC_D, CMP_DEVID, DEVID_KEYS,
-                        ENGINE_KEYS, ENGINE_PAIR_KEYS, FIELDS, FF_ROW_MAX,
-                        FF_ROW_MIN, block_mask, get_bits, set_bits)
+from .optionmap import (A100_DEVID, A100_MAGIC_D, BY_KEY, CMP_DEVID,
+                        DEVID_KEYS, ENGINE_KEYS, ENGINE_PAIR_KEYS, FIELDS,
+                        FF_ROW_MAX, FF_ROW_MIN, block_mask, get_bits, set_bits)
 
 # What the fused-device-id rewrite means, said out loud in every plan that
 # carries it: it is the one burn that changes what the card *is*, and it drags
@@ -95,7 +95,8 @@ MIG_WARNINGS = (
 )
 
 
-def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False):
+def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False,
+         allow_hard_floor=False):
     # Without a complete FF-row snapshot we cannot know which rows are
     # occupied or what the current block values are; refuse rather than
     # append records onto already-burnt rows.
@@ -138,6 +139,44 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False):
     targets = rep["targets"]
     warnings = list(rep["warnings"])
     words = dump["option_words"]
+
+    # Clearing the disable bit of a block the factory marked dead is not an
+    # ambitious plan, it is a different kind of failure: the shadow registers
+    # follow OPT_DISABLE, so the readout agrees with the plan, while the block
+    # stays dead and (measured on this bench's 8 GB card, where fbp_disable
+    # equals fbp_defective at 0x2d) GSP-RM never gets past the booter's
+    # instruction fetch. *_DEFECTIVE sits in the hard rows, outside the FF
+    # address space, so no record in this plan can overrule it -- an RIR record
+    # could, and an 8 GB SKU card was read out with no free RIR slot to put one
+    # in. Refusing beats emitting a plan whose own analysis section then reports
+    # a capacity the burn cannot deliver.
+    hard = rep["hard"]
+    below = [k for k in hard["beyond"]
+             if targets.get(k) != words.get(k)]
+    if below and not allow_hard_floor:
+        def why(k):
+            """One line per offending field: the mask, and where it lives."""
+            defect = BY_KEY[k].defect_key or k
+            field = hardrows.HARD_BY_KEY.get(defect)
+            where = (", ".join(hardrows.coord(o, hardrows.WIDTHS[defect])
+                               for o in field.offsets)
+                     if field and field.offsets else
+                     "a position no sample here pins down")
+            return "%s -> 0x%x while %s reads 0x%x (%s)" % (
+                k, targets[k], defect, words.get(defect, 0), where)
+        raise hardrows.BeyondHardFloor(
+            "the plan asks for a state the hard rows forbid (%s). *_DEFECTIVE is "
+            "a hard-row mask, outside the FF address space, so no record here "
+            "reaches it: the burn would move the shadow registers and not the "
+            "silicon -- measured on fbp_disable, STATUS_OPT_FBP followed the "
+            "target while the card kept its ceiling, and GSP-RM stopped at "
+            "PTOP_GFW_BOOT=0x1 with gsp_riscv_status=0. Hard ceiling: %s. Only an "
+            "RIR record overrules a hard row, and an 8 GB SKU card of this bench "
+            "reads 0 of 16 free slots; --allow-hard-floor says this is a "
+            "deliberate experiment"
+            % ("; ".join(why(k) for k in below),
+               ("%d GiB (%d FBP)" % (hard["ceiling_gib"], hard["ceiling_fbp"])
+                if hard["ceiling_gib"] is not None else "unknown")))
 
     base = {c: dict(b) for c, b in replay_blocks(dump).items()}
     pending = {c: dict(b) for c, b in base.items()}
@@ -295,6 +334,11 @@ def plan(dump, only=None, skip=(), overrides=None, a100=False, mig=False):
             # proved, and whether the software override route was even alive.
             "media": rep["media"],
             "nvlink_ok": rep["nvlink_ok"], "pcie_gen4_ok": rep["pcie_gen4_ok"],
+            # The hard-row side of the same question: what the silicon allows
+            # regardless of this plan, what the FF pool can still buy, and what
+            # an RIR record would cost. A plan file is a burn order, and "these
+            # rows buy 16 GiB" has to be checkable against the ceiling from it.
+            "hard": rep["hard"],
         },
         "warnings": warnings,
     }

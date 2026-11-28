@@ -14,16 +14,18 @@
 | 命令 | 作用 |
 |---|---|
 | `scan --dir collected [--outdir cards --plans plans] [--mig] [--a100]` | 全表潜力分析 + 按 UUID 保存 dump 与计划；FF 行未知时不出计划（rc=1） |
-| `report dump.json` | 单卡分析：潜力、媒体引擎/MIG、运行时状态、熔丝身份 |
+| `report dump.json` | 单卡分析：硬行天花板、潜力、媒体引擎/MIG、运行时状态、熔丝身份 |
 | `gen dump.json -o plan.json [--ffrows ffrows.txt] [--mig] [--a100] [--only …] [--skip …] [--set k=v]` | 生成 FF 烧写记录（自动 16-bit 块合并）；FF 记录未读时拒绝出计划（rc=2，不写文件） |
 | `sim dump.json plan.json [--ffrows ffrows.txt]` | 逐字段回放核对 |
 | `verify <plan> --dir collected [--ffrows ffrows.txt] \| --dump dump.json` | UUID / fingerprint / 回放 核验 |
 | `mergeff dump.json ffrows.txt` | 合并外部读出的 FF 行并报告覆盖是否完整 |
+| `defmap dump.json... [--pin [卡:]字段=HEX] [--keys 字段]` | 从快照重新推导 `*_DEFECTIVE` 在出厂硬行（0–221）中的位置，并证明 `*_disable` 不在那里（纯计算，不碰卡；需含出厂行的快照） |
+| `rir 0x… ×8 \| --file 文件` | 解码外部读出的 RIR 宏并统计空槽（纯计算：本仓库不读也不烧 RIR） |
 | `burntool status --bdf …` | 写窗口判据（只读） |
 | `burntool burn plan.json --dump dump.json --bdf … [--rows 315] [--force] [--yes]` | 断言式烧写（`docs/BURNING.md` §5） |
 | `burntool swiff plan.json [--dump …] [--rows …]` | 把计划记录作为易失 IFF 熔丝应用于本次启动，冷启动即撤销（`docs/BURNING.md` §6，本仓库未在实卡执行过） |
 
-常用参数：`--set fbp_disable=0x840` 钉目标值；`--only` / `--skip` 过滤字段，首条试烧建议 `--only fbp_disable`。
+常用参数：`--set fbp_disable=0x840` 钉目标值；`--only` / `--skip` 过滤字段，首条试烧建议 `--only fbp_disable`；`--allow-hard-floor` 允许目标值低于出厂缺陷底线（默认拒绝，见「硬行与 RIR」）。
 
 ## 计划范围
 
@@ -48,7 +50,7 @@ sudo bash scripts/ffscan.sh --mig        # 追加媒体引擎
 sudo bash scripts/ffscan.sh --a100       # 追加身份改写（--no-magic-d 只改 devid）
 ```
 
-脚本构建 `ffprobe.ko`，对每张 CMP 170HX（device `0x20c2`；已改写身份的为 `0x20b5`，两种都识别）读取 105 个寄存器，并按 `CMD_READ` 读出全部 512 物理熔丝行（只写 `FUSEADDR`/`FUSECTRL`；控制器非 IDLE 则中止并如实报 partial），随后关联 UUID 并出表：
+脚本构建 `ffprobe.ko`，对每张 CMP 170HX（device `0x20c2`；已改写身份的为 `0x20b5`，两种都识别）读取 106 个寄存器，并按 `CMD_READ` 读出全部 512 物理熔丝行（只写 `FUSEADDR`/`FUSECTRL`；控制器非 IDLE 则中止并如实报 partial），随后关联 UUID 并出表：
 
 ```
 card UUID                                BDF           FB now->max    SM  FP         plan
@@ -79,7 +81,7 @@ GPU-38bbb4b3-…-0cce33417b95              0000:05:00.0  80->80 GiB    124 fc497
 | `old` → `new` | 该 16-bit 块由真实 FF 快照回放出的当前值 → 烧后有效值；相邻字段的块合并为一条记录 |
 | `fields` | 该记录在该块内真正改动了哪些 option word 的位，即烧它的理由 |
 
-顶层另有 `uuid` / `fingerprint`（计划身份）、`targets`（各 option word 目标值）、`analysis`（FB/SM 潜力，含 `--mig` 时的 `analysis.mig` 与 `analysis.engines`）、`warnings`。
+顶层另有 `uuid` / `fingerprint`（计划身份）、`targets`（各 option word 目标值）、`analysis`（FB/SM 潜力，含 `--mig` 时的 `analysis.mig` 与 `analysis.engines`、以及 `analysis.hard` 硬行天花板）、`warnings`。
 
 `cards/<uuid>.json` 是完整快照，计划由它推出：
 
@@ -89,7 +91,7 @@ GPU-38bbb4b3-…-0cce33417b95              0000:05:00.0  80->80 GiB    124 fc497
 | `sku` | `8gb` / `10gb`，决定每个 FBP 的折算容量 |
 | `ff_rows` | 全部 512 行快照（0–221 出厂 OTP、222–487 FF、488–507 IFF）；未烧行值为 0。计划的存在性与正确性完全依赖该字段覆盖完整。值支持 `"0x0fe805c1"` 与 `267006913` 两种写法，读取统一经 `ffcalc/dump.py` 归一化；新写入统一为 `0x%08x` |
 | `option_words` | 当前有效值（`status` 优先于 `fused`，含 `*_defective` 底线）；`xxx__fused` 表示二者不一致 |
-| `info` | 只读状态字：熔丝宏（`crc_status`、`efp_status`、`dis_program`、`dsov_status`、`fuse_debugctrl`、`priv_mask`、`plm_fuse_wdata`、`wdata_wr_secure`、`iff_record`、`en_sw_override`）、feature-override 岛（`feat_ovr_*`、`feat_readout_1`）、融合速率档（`ss_*`）、ECC（`opt_ecc_en`、`ecc_ctrl`）、显存几何（`fbpa_cfg1`、`mmu_lmr`、`cstatus_ramamount`）、板级（`gfw_boot`、`opt_pcie_lane_*`、`hbm_pll_*`）、媒体引擎 `OPT_*`/`STATUS_OPT_*` 对 |
+| `info` | 只读状态字：熔丝宏（`crc_status`、`efp_status`、`dis_program`、`dsov_status`、`fuse_debugctrl`、`fuse_debugctrl_plm`、`priv_mask`、`plm_fuse_wdata`、`wdata_wr_secure`、`iff_record`、`en_sw_override`）、feature-override 岛（`feat_ovr_*`、`feat_readout_1`）、融合速率档（`ss_*`）、ECC（`opt_ecc_en`、`ecc_ctrl`）、显存几何（`fbpa_cfg1`、`mmu_lmr`、`cstatus_ramamount`）、板级（`gfw_boot`、`opt_pcie_lane_*`、`hbm_pll_*`）、媒体引擎 `OPT_*`/`STATUS_OPT_*` 对 |
 | `read_only` | 本次采集是否零写入（执行过 `CMD_READ` 则为 false） |
 
 `collected/` 为原始留档：`bar0map.tsv`（BDF、BAR0 物理基址、UUID）、`probe_<bdf>.txt`（dmesg 摘录，`FFPROBE <名字> <地址> <值>`；`ffrow.<n>` 即第 n 行，`ffrow_error` 表示读行中止）、`kprobe/`（模块源码与产物）。这些与 `cards/`、`plans/` 都是运行产物，不提交。
@@ -123,6 +125,18 @@ python3 -m ffcalc.burntool burn   plans/<uuid>.burn.json --dump cards/<uuid>.jso
 FF 记录决定资源集合（可用 FBP/GPC/TPC/PES/ROP-L2、NVLink、SYS_PIPE、媒体引擎、PCIe 代际、熔丝 device id）。计算速率档、ECC 开关、显存几何映射不由 FF 池承载，而是每次启动由主机侧解锁程序写入的易失寄存器，断电或驱动内 FLR 后回到出厂值。两层互不蕴含：本仓库的卡 `OPT_ECC_EN` 熔丝为 0，而 `ECC_CTRL` 在本启动报使能；速率选择字仍是出厂值，而计算块不节流。
 
 `report` 的 `[Runtime state (BAR0, this boot)]` 段输出后者，实测读数与逐条解释见 `docs/BURNING.md` §8。快照缺字时该项显示 `not read`，不以 0 填充。
+
+## 硬行与 RIR（容量天花板的另一半）
+
+`*_DISABLE` 在 FF 池里，可以烧；`*_DEFECTIVE` 在出厂硬行（行 0–221）里，FF 记录寻不到它——记录编码的是 `(chain, block)`，而任何 `(chain, block)` 都落不到硬行上。所以显存潜力有两个不同的数：硅片允许的（由 `fbp_defective` 决定，烧写不动）和 FF 池还能买到的（当前 `fbp_disable` 与 `fbp_defective` 的差）。`report` 的 `[Hard rows]` 段把两者分开打印，`analysis.hard` 里带同一份数据。
+
+- **位置由 `defmap` 从快照重算**，不是抄来的：把行 0–221 按冗余对取偶数行拼成 111 个字、3552 位的定宽位串，穷举每个偏移，要求每张卡的影子读数都等于它的 option word。三张卡（`fbp_defective` 分别 `0x840`/`0x840`/`0x2d`，其余 defective 字段也各不相同）解出的 `fbp_defective` 唯一落在 `row26 bit16..27`，`pes_defective` 唯一落在 `row34 bit20..row36 bit11`（跨字：只在拼平成串后才解得出），`tpc_gpc2/4/5` 各一个偏移；`gpc`/`tpc_gpc7` 与 `fbpa`/`fbio`/`rop_l2` 分别互为别名（现有样本分不开，`defmap` 如实报 alias 而不是硬选一个）。只有一张卡时它报"未被判别"而不是重复表里的答案：一块 die 上模式不重复只是运气，不是证据。
+- **反向证据同样重要**：`--pin 38bbb:fbp_disable=0x852` 声明"这块 die 在生命里某刻该字段读过 0x852"（烧前值）。硬行是静态的，同一 die 不可能在同一偏移读出两个值 ⇒ 候选归零，即该字段不在硬行。三张卡的 `*_disable` 都是这个结果，这解释了为什么烧 `fbp_disable` 从不改动 defective 掩码。`--keys fbp_disable,pes_disable` 可以在不给 `--pin` 的情况下把这类字段单独打出来——但要知道自己在看什么：出厂态 `disable == defective`，两张烧过的卡也已落到 defective 集合，所以不带 pin 时 `fbp_disable` 的唯一候选就是 `fbp_defective` 那个窗口，`defmap` 会写明"这不是硬行字段，只是本批样本里两个字读起来一样"而不是把它当成对表的反驳。
+- **行 26 是一个自洽性检查**：三块 die 的行 26 里每个置位的 bit 都能被表里已定位（或已列为别名）的位段解释——bit 0..7 是 `gpc_defective` 的别名之一（那块 GPC5 判死的卡在这里是 `0x20`）、bit 16..27 是 `fbp_defective`、bit 28..31 是那个 24 位成对掩码的低 4 位。源文档列为"含义未证"的 row26 bit28/29 就是这么来的：8 分区卡的 FBP0 判死 ⇒ 成对两位为 `11`，10 分区卡的 FBP0/1 都好 ⇒ 高半字为 0。别名候选里若某个窗口与已唯一定位的字段共用 bit，`defmap` 会单独标出来（两个 option word 不会读同一个熔丝位，所以那个候选最不可能），而不是把它和别的候选并列。
+- **只含 option words 的快照不能判别**：`ffscan.sh FFROWS=0`（忙卡）写出的快照没有出厂行。这种快照不会被当成"全零阵列"（那会把"没读到"错报成"不在硬行里"），而是被排除并在表头点名；若整批都没有出厂行，`defmap` 直接 `FAIL`。
+- **四个寄存器一份判断**：`fbp_defective` 是 12 位掩码，`fbpa`/`fbio`/`rop_l2_defective` 是 24 位、每个 FBP 占两位（FBP i = bit 2i、2i+1）。实测三张卡三者都折算回同一个 FBP 集合，故 `report` 用它做免费的快照自检；不等值时打印 `CROSS-CHECK FAILS`（`samples/blog_card_example.json` 的 fbio/rop_l2 就不是成对编码，该样本只能按 `fbp_defective` 读容量）。
+- **目标值清掉判死块的 disable 位不再出计划，而是 `REFUSED`（rc=2）**，`--allow-hard-floor` 显式放行。放行后的实测后果：`STATUS_OPT_FBP` 会跟随 `OPT_DISABLE`（影子寄存器不等于硅片还在），容量仍是硬天花板，且该卡 GSP-RM 起不来（`PTOP_GFW_BOOT=0x1`、`gsp_riscv_status=0`）。潜力一律按 `target | defective` 折算（FB 与 SM 两侧都是），所以 `--set fbp_disable=0x0` 在 10 活 2 死的卡上报 80 GiB，不再报 96 GiB。
+- **RIR 是唯一能盖住硬行的机制**：8 行 × 每行两条 16-bit 记录 = 16 槽，`rec = (abs_bit << 2) | (value << 1) | 1`，`abs_bit = 行*32 + 位`；记录把主阵列该位的**读数**替换成 value，双向都可以（把已烧成 1 的位读成 0 也行）。`rir` 命令只做纯解码。本 bench 的 8 GB SKU 卡由外部工具读出为 rows 0–6 全 `0xffffffff`、row7 `0xffff0923` ⇒ 16 槽全部耗尽（`0x0923` = 出厂在 `row18:bit8` 强制 1 的记录，与该卡 row18/row19 仅差 bit8 互为印证）。一个硬行位一条记录 ⇒ 这张卡的 64 GiB 天花板没有任何可写入口，与"我们不打算碰 RIR"是两条独立的理由。10 GB SKU 的槽位读数外部报告为全空，本 bench 未读过，故只按"可能但未证"记录。
 
 ## 媒体引擎与 MIG（`--mig`）
 
@@ -170,6 +184,9 @@ FF 记录决定资源集合（可用 FBP/GPC/TPC/PES/ROP-L2、NVLink、SYS_PIPE�
 |---|---|---|
 | `FAIL: <快照路径>: …` | 2 | 快照不可信（行号越界、值超 32 位、JSON 不完整、同行双值）。文件未被修改；修正后重跑或重新采集 |
 | `REFUSED: ff_rows is empty / covers only …`（gen） | 2 | FF 快照不全，未写出计划；走「FF 行读取不可用时的处置」 |
+| `REFUSED: … clears FBP … that fbp_defective marks dead …`（gen） | 2 | 目标值低于硬行天花板：硬行位 FF 记录够不到，影子寄存器会跟着目标变、显存不会在。确认要做该实验则 `--allow-hard-floor` |
+| `FAIL: no snapshot in this run carries factory rows …`（defmap） | 2 | 传进来的快照只有 option words（`FFROWS=0` 的忙卡读数就是这种），没有出厂行就没有判别力；带行的快照或 `mergeff` 补行后重跑 |
+| `FAIL: line N …`（rir） | 2 | RIR 读数解析不了（不是 8 行的行读数、一行两个值、行数超出）；槽位数是有分量的结论，宁可拒绝也不半读 |
 | `SKIPPED (FF rows not read)`（scan 表格） | 1 | 同上，dump 已保存，补行后重跑 |
 | `STILL partial: N of 266 FF rows unknown`（mergeff） | 1 | 行文件未列全（通常是未烧行未写 0） |
 | verify `FAIL: …` | 1 | 换卡重采 / 排查 defective 是否被烧 / 先补 FF 行 |
@@ -192,7 +209,7 @@ bits[4:0] = chain   bits[15:6] = 16-bit 块号   bits[31:16] = 块新值   (bit5
 
 ## 采集原理
 
-目标内核拒绝 GPU BAR0 的 sysfs `resource0` mmap（BAR1/3 正常），故走 `samples/gen_probe_c.py` 从 `ffcalc/data/ga100-fuses.json` 生成的内核模块：`ioremap(bar0, PROBE_MAPLEN)` → `readl` 全表 → 可选 `CMD_READ` 读行 → `pr_info` → 自卸载。`PROBE_MAPLEN` 由表内最大偏移自动推导（当前 `0x9a5000`，覆盖到 `0x9a3c7c` 的 FB/HBM 侧寄存器），模块内对越界表项跳过读取——超出映射的 MMIO 读在带驱动的卡上是内核 OOPS。words 通道对设备零写入；`capture.py` 默认 `O_RDONLY` + `ACCESS_READ` 映射，只有 `CMD_READ` 与烧写路径请求可写映射。`ffscan.sh` 在检测到计算进程时拒绝 `insmod`。原始日志格式：
+目标内核拒绝 GPU BAR0 的 sysfs `resource0` mmap（BAR1/3 正常），故走 `samples/gen_probe_c.py` 从 `ffcalc/data/ga100-fuses.json` 生成的内核模块：`ioremap(bar0, PROBE_MAPLEN)` → `readl` 全表 → 可选 `CMD_READ` 读行 → `pr_info` → 自卸载。`PROBE_MAPLEN` 由表内最大偏移自动推导（当前 `0x9a5000`，覆盖到 `0x9a3c7c` 的 FB/HBM 侧寄存器），模块内对越界表项跳过读取——超出映射的 MMIO 读在带驱动的卡上是内核 OOPS。words 通道对设备零写入；`capture.py` 默认 `O_RDONLY` + `ACCESS_READ` 映射，只有 `CMD_READ` 与烧写路径请求可写映射。`ffscan.sh` 在检测到计算进程时拒绝 `insmod`。RIR 宏（行 0–7）不在读表里：切到该宏要写 `FUSEDEBUG` 的 bit1，words 通道就不再是零写入；本仓库不碰 RIR，该宏的读数一律作为外部数据输入（`rir` 命令）。原始日志格式：
 
 ```
 FFPROBE <字段名> <寄存器物理地址> <32bit值>      # 熔丝行行名形如 ffrow.<行号>
@@ -203,6 +220,9 @@ FFPROBE <字段名> <寄存器物理地址> <32bit值>      # 熔丝行行名形
 ## 已确认事实
 
 - 采集过的三张卡：两张 80 GiB 潜力（10 FBP，124 SM / 108 SM），一张 64 GiB 封顶（`defective 0x2d`）；defective 底线全部读到，option word 映射与研究数据一致。
+- 硬行位置由本仓库自己的三张快照独立重算得到（`defmap`，非外部报告转抄）：`fbp_defective` = 行26 bit16..27 唯一解；`pes_defective` = 行34 bit20..行36 bit11 唯一解；`tpc_gpc2/4/5` 各一个偏移；`gpc`/`tpc_gpc7` 与 `fbpa`/`fbio`/`rop_l2` 互为别名。三块 die 的"两份不等值"行号完全相同（21 行：18、48–80 偶数、84、86、94），而 `CRC_STATUS` 仍是 `0x55`——"每个出厂行都有等值副本"在这 21 行上不成立。
+- 清掉判死 FBP 的 disable 位实测：`STATUS_OPT_FBP` 跟随 `OPT_DISABLE`（读数与计划一致），但容量仍是硬天花板，且该卡 GSP-RM 停在 booter 取指（`PTOP_GFW_BOOT=0x1`、`gsp_riscv_status=0`）。所以"影子读数对上了"不是容量类计划的成功判据。
+- RIR：外部工具对本 bench 8 GB SKU 卡读出 rows 0–6 全 `0xffffffff`、row7 `0xffff0923`（16 槽耗尽，`0x0923` 为出厂 `row18:bit8` 强制 1 的记录，与该卡 row18/row19 仅差 bit8 相互印证）。本仓库不读也不写 RIR，只保留纯解码；槽位编号的低/高半字先后次序未定，故输出必附原始行字。
 - 烧写闭环：一张卡 17 条记录（行 304–320），`CMD_PROGRAM=2` 确认（瞬时 `0xE00C0000`）、空白行读 0、CRC 自动重算（烧后仍 `0x55`）、冷启动 `BOOT0=0x170000a1`、潜力全部落地。细节与断言清单见 `docs/BURNING.md`。
 - 两卡当前状态：512 行快照齐全、计划 0 记录、`IFF_RECORD=0x01fb01e8`、`CRC=0x55`、`EFP=1`、`DIS_PROGRAM=0`、`PRIV_MASK=PLM_FUSE_WDATA=0xffffffff`、`GFW_BOOT=0x3FF`。
 - `DISABLE_GEN3_SPEED` 在 block39 的位归属（bit1 或 bit9）未定，默认两位全清；实测两位全清且 `MAGIC_BITS_D` 仅动 bit25 时 Gen4 训练通过。
@@ -215,6 +235,8 @@ FFPROBE <字段名> <寄存器物理地址> <32bit值>      # 熔丝行行名形
 ffcalc/optionmap.py    option word ↔ FF chain/bit 映射、FF/IFF 行区间
 ffcalc/ffrecord.py     FF 32-bit 记录编解码 + 链回放
 ffcalc/ffrows.py       FF 行快照完整性判定 + 外部行文件解析/合并
+ffcalc/hardrows.py     出厂硬行位段表 + 从快照穷举求解 + 按 FBP 的容量折算
+ffcalc/rir.py          RIR 记录编解码与槽位清点（纯计算，不碰卡）
 ffcalc/ffmacro.py      融合宏协议（CMD_READ 读行、sense/arm/program_row、IFF 预演、写窗口判据；Python 与内核 C 同源）
 ffcalc/burntool.py     断言式烧写 CLI（status / burn / swiff）
 ffcalc/analyze.py      潜力分析与运行时状态
@@ -236,7 +258,7 @@ Debian 12，内核 6.18.x-trim，nvidia-open 610.x（含 cmpunlocker 的 p2p 与
 
 ## 数据来源与致谢
 
-寄存器地址与 option word 位映射来自 [kate-land / ga100vfi](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/) 的社区研究，非 NVIDIA 官方文档；`CMD_READ` 读行流程（`FUSECTRL`/`FUSEADDR`/`FUSEDATA` 偏移、IDLE 判据、超时与地址恢复）照其 `gpu0-registers/gpu0-capture` 实现，见 `ffcalc/ffmacro.py`。媒体引擎与 MIG 一节另采信一份 CMP 170HX 的 floorsweep 报告（stock `nvidia-615srv-open` + `zagitta/gpu-unlock`，CC0），其中功能侧结论本仓库未复现，已在各处标注。
+寄存器地址与 option word 位映射来自 [kate-land / ga100vfi](https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/) 的社区研究，非 NVIDIA 官方文档；`CMD_READ` 读行流程（`FUSECTRL`/`FUSEADDR`/`FUSEDATA` 偏移、IDLE 判据、超时与地址恢复）照其 `gpu0-registers/gpu0-capture` 实现，见 `ffcalc/ffmacro.py`。媒体引擎与 MIG 一节另采信一份 CMP 170HX 的 floorsweep 报告（stock `nvidia-615srv-open` + `zagitta/gpu-unlock`，CC0），其中功能侧结论本仓库未复现，已在各处标注。硬行的存在、以及 `FUSEDEBUG` bit1 是 RIR 读多路器，出自 [ahnguyen17/ga100-fuse-re](https://github.com/ahnguyen17/ga100-fuse-re)；RIR 记录格式、`0x00950015` 这条已烧记录、"8 GB SKU 的 RIR 出厂已满 / 10 GB SKU 全空"出自 [lixiangwuxian/170hx-rir-tool](https://github.com/lixiangwuxian/170hx-rir-tool) 与 [cmp.wiki](https://cmp.wiki)（Unlocks、RIR fuse burn、Fuses and floorsweep maps 三页）。硬行的具体坐标不依赖这些来源：本仓库用 `defmap` 从自己的三张快照重算，一致与超出之处都写进「硬行与 RIR」一节；RIR 一侧本仓库没写过任何东西，也没读过那个宏。
 
 ## License
 
